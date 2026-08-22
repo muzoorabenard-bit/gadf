@@ -1,0 +1,31 @@
+{
+  "name": "gadf-vscode",
+  "displayName": "G.A.D.F",
+  "description": "Chat with G.A.D.F without leaving VS Code",
+  "version": "0.1.0",
+  "private": true,
+  "engines": {
+    "vscode": "^1.85.0"
+  },
+  "categories": ["Other"],
+  "activationEvents": [
+    "onCommand:gadf.openChat"
+  ],
+  "main": "./out/extension.js",
+  "contributes": {
+    "commands": [
+      {
+        "command": "gadf.openChat",
+        "title": "G.A.D.F: Open Chat"
+      }
+    ]
+  },
+  "scripts": {
+    "compile": "tsc -p ./"
+  },
+  "devDependencies": {
+    "@types/node": "^22.5.4",
+    "@types/vscode": "^1.85.0",
+    "typescript": "^5.5.3"
+  }
+}
