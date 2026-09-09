@@ -11,7 +11,7 @@ const SERVICE_ROLE_KEY = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")!;
 const GOOGLE_CLIENT_ID = Deno.env.get("GOOGLE_CLIENT_ID")!;
 const GOOGLE_CLIENT_SECRET = Deno.env.get("GOOGLE_CLIENT_SECRET")!;
 const REDIRECT_URI = `${SUPABASE_URL}/functions/v1/gadf-google-auth-callback`;
-const WEB_URL = Deno.env.get("GADF_WEB_URL") ?? "https://gadf-assistant.netlify.app";
+const WEB_URL = Deno.env.get("GADF_WEB_URL") ?? "https://muzoorabenard-bit.github.io/gadf";
 
 serve(async (req) => {
   const url = new URL(req.url);

@@ -7,7 +7,7 @@ import Chat from "@/pages/Chat";
 export default function App() {
   return (
     <AuthProvider>
-      <BrowserRouter>
+      <BrowserRouter basename="/gadf">
         <Routes>
           <Route path="/login" element={<Login />} />
           <Route

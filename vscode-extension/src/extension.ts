@@ -1,6 +1,6 @@
 import * as vscode from "vscode";
 
-const GADF_URL = "https://gadf-assistant.netlify.app";
+const GADF_URL = "https://muzoorabenard-bit.github.io/gadf";
 
 export function activate(context: vscode.ExtensionContext) {
   const disposable = vscode.commands.registerCommand("gadf.openChat", () => {
