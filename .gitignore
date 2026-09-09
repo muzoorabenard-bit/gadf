@@ -1,0 +1,18 @@
+node_modules/
+dist/
+.env
+.env.local
+.DS_Store
+supabase/.temp/
+
+# Android / Wear OS
+watch/local.properties
+watch/.gradle/
+watch/.idea/
+watch/**/build/
+watch/*.iml
+watch/**/*.iml
+
+# VS Code extension build output
+vscode-extension/out/
+
