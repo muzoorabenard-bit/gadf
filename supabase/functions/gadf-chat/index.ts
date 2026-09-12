@@ -102,7 +102,7 @@ const googleTools = [
   {
     name: "drive_read_file",
     description:
-      "Read a Drive file's content by its file ID. Google Docs/Sheets/Slides are exported as text/CSV/text; PDFs and Word/Excel/PowerPoint files (.doc/.docx/.xls/.xlsx/.ppt/.pptx) are converted and OCR'd on the fly (long scanned PDFs may come back truncated — only the first ~10 pages get OCR'd); plain text, Markdown, JSON, HTML, and CSV are read directly. Images and other binary formats aren't supported yet.",
+      "Read a Drive file's content by its file ID. Google Docs/Sheets/Slides are exported as text/CSV/text; PDFs, Word/Excel/PowerPoint files (.doc/.docx/.xls/.xlsx/.ppt/.pptx), and images (JPEG/PNG/GIF/BMP/TIFF) are converted and OCR'd on the fly — for images this extracts any visible text, it does not describe the image (long scanned PDFs may come back truncated, since only the first ~10 pages get OCR'd); plain text, Markdown, JSON, HTML, and CSV are read directly.",
     input_schema: {
       type: "object",
       properties: { fileId: { type: "string" } },
@@ -255,6 +255,11 @@ async function runGoogleTool(
       "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet": "application/vnd.google-apps.spreadsheet",
       "application/vnd.ms-powerpoint": "application/vnd.google-apps.presentation",
       "application/vnd.openxmlformats-officedocument.presentationml.presentation": "application/vnd.google-apps.presentation",
+      "image/jpeg": "application/vnd.google-apps.document",
+      "image/png": "application/vnd.google-apps.document",
+      "image/gif": "application/vnd.google-apps.document",
+      "image/bmp": "application/vnd.google-apps.document",
+      "image/tiff": "application/vnd.google-apps.document",
     };
 
     let contentRes: Response;
@@ -292,7 +297,7 @@ async function runGoogleTool(
       }
     } else {
       return {
-        error: `"${meta.name}" is a ${meta.mimeType} file. gadf can read Google Docs/Sheets/Slides, PDFs, Word/Excel/PowerPoint files, and plain text/Markdown/CSV/JSON/HTML — but not images or other binary formats.`,
+        error: `"${meta.name}" is a ${meta.mimeType} file, which gadf can't read yet.`,
       };
     }
     if (!contentRes.ok) return { error: `Could not read file content (${contentRes.status})` };
