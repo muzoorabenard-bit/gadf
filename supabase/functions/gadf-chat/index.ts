@@ -102,7 +102,7 @@ const googleTools = [
   {
     name: "drive_read_file",
     description:
-      "Read a Drive file's content by its file ID. Google Docs, Sheets, and Slides are exported as text/CSV/text; plain text, Markdown, JSON, HTML, and CSV files are read directly. PDFs, Word/Excel/PowerPoint (.docx/.xlsx/.pptx), images, and other binary formats aren't supported yet — trying to read one returns an error instead of garbled content.",
+      "Read a Drive file's content by its file ID. Google Docs/Sheets/Slides are exported as text/CSV/text; PDFs and Word/Excel/PowerPoint files (.doc/.docx/.xls/.xlsx/.ppt/.pptx) are converted and OCR'd on the fly (long scanned PDFs may come back truncated — only the first ~10 pages get OCR'd); plain text, Markdown, JSON, HTML, and CSV are read directly. Images and other binary formats aren't supported yet.",
     input_schema: {
       type: "object",
       properties: { fileId: { type: "string" } },
@@ -244,6 +244,18 @@ async function runGoogleTool(
       "text/html",
       "application/json",
     ]);
+    // Drive can convert these into a Google-native copy on the fly — for PDFs
+    // and images this also runs OCR, though only the first ~10 pages / a few
+    // MB get OCR'd, so long scanned PDFs may come back truncated.
+    const convertibleToGoogle: Record<string, string> = {
+      "application/pdf": "application/vnd.google-apps.document",
+      "application/msword": "application/vnd.google-apps.document",
+      "application/vnd.openxmlformats-officedocument.wordprocessingml.document": "application/vnd.google-apps.document",
+      "application/vnd.ms-excel": "application/vnd.google-apps.spreadsheet",
+      "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet": "application/vnd.google-apps.spreadsheet",
+      "application/vnd.ms-powerpoint": "application/vnd.google-apps.presentation",
+      "application/vnd.openxmlformats-officedocument.presentationml.presentation": "application/vnd.google-apps.presentation",
+    };
 
     let contentRes: Response;
     if (exportMimeType[meta.mimeType]) {
@@ -256,9 +268,31 @@ async function runGoogleTool(
         `https://www.googleapis.com/drive/v3/files/${fileId}?alt=media`,
         { headers: authHeaders },
       );
+    } else if (convertibleToGoogle[meta.mimeType]) {
+      const targetMimeType = convertibleToGoogle[meta.mimeType];
+      const copyRes = await fetch(`https://www.googleapis.com/drive/v3/files/${fileId}/copy?fields=id`, {
+        method: "POST",
+        headers: { ...authHeaders, "Content-Type": "application/json" },
+        body: JSON.stringify({ name: `gadf-temp-${meta.name}`, mimeType: targetMimeType }),
+      });
+      if (!copyRes.ok) {
+        return { error: `Could not convert "${meta.name}" for reading (${copyRes.status}): ${await copyRes.text()}` };
+      }
+      const copy = await copyRes.json();
+      try {
+        contentRes = await fetch(
+          `https://www.googleapis.com/drive/v3/files/${copy.id}/export?mimeType=${encodeURIComponent(exportMimeType[targetMimeType])}`,
+          { headers: authHeaders },
+        );
+      } finally {
+        await fetch(`https://www.googleapis.com/drive/v3/files/${copy.id}`, {
+          method: "DELETE",
+          headers: authHeaders,
+        }).catch(() => {});
+      }
     } else {
       return {
-        error: `"${meta.name}" is a ${meta.mimeType} file. gadf can currently only read Google Docs/Sheets/Slides and plain text/Markdown/CSV/JSON/HTML files — not PDFs, Word/Excel/PowerPoint files, images, or other binary formats.`,
+        error: `"${meta.name}" is a ${meta.mimeType} file. gadf can read Google Docs/Sheets/Slides, PDFs, Word/Excel/PowerPoint files, and plain text/Markdown/CSV/JSON/HTML — but not images or other binary formats.`,
       };
     }
     if (!contentRes.ok) return { error: `Could not read file content (${contentRes.status})` };
