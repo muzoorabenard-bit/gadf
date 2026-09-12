@@ -1,1 +1,4 @@
 project_id = "dmjywulepjrwptjsilgl"
+
+[functions.gadf-google-auth-callback]
+verify_jwt = false
