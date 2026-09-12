@@ -78,16 +78,31 @@ async function getGoogleAccessToken(supabase: SupabaseClient, userId: string): P
 const googleTools = [
   {
     name: "drive_search",
-    description: "Search the user's Google Drive by file name or content.",
+    description: "Search the user's Google Drive by file name or content, optionally scoped to inside one folder.",
     input_schema: {
       type: "object",
-      properties: { query: { type: "string", description: "Search text" } },
+      properties: {
+        query: { type: "string", description: "Search text" },
+        folderId: { type: "string", description: "Restrict the search to inside this folder's ID (optional — omit to search all of Drive)" },
+      },
       required: ["query"],
     },
   },
   {
+    name: "drive_list_folder",
+    description:
+      "List the files and subfolders directly inside a Drive folder, newest changes first. Use drive_search first to find a folder's ID by name if you don't already have it.",
+    input_schema: {
+      type: "object",
+      properties: {
+        folderId: { type: "string", description: "The folder's Drive file ID. Omit to list the top level of My Drive." },
+      },
+    },
+  },
+  {
     name: "drive_read_file",
-    description: "Read a Drive file's content by its file ID (Google Docs/Sheets are exported as text/CSV).",
+    description:
+      "Read a Drive file's content by its file ID. Google Docs, Sheets, and Slides are exported as text/CSV/text; plain text, Markdown, JSON, HTML, and CSV files are read directly. PDFs, Word/Excel/PowerPoint (.docx/.xlsx/.pptx), images, and other binary formats aren't supported yet — trying to read one returns an error instead of garbled content.",
     input_schema: {
       type: "object",
       properties: { fileId: { type: "string" } },
@@ -186,12 +201,25 @@ async function runGoogleTool(
   const authHeaders = { Authorization: `Bearer ${accessToken}` };
 
   if (name === "drive_search") {
-    const q = `fullText contains '${String(input.query).replace(/'/g, "\\'")}' or name contains '${String(input.query).replace(/'/g, "\\'")}'`;
+    const term = String(input.query).replace(/'/g, "\\'");
+    let q = `(fullText contains '${term}' or name contains '${term}') and trashed = false`;
+    if (input.folderId) q += ` and '${String(input.folderId).replace(/'/g, "\\'")}' in parents`;
     const res = await fetch(
       `https://www.googleapis.com/drive/v3/files?q=${encodeURIComponent(q)}&fields=files(id,name,mimeType,modifiedTime)&pageSize=15`,
       { headers: authHeaders },
     );
     if (!res.ok) return { error: `Drive search failed (${res.status})` };
+    return await res.json();
+  }
+
+  if (name === "drive_list_folder") {
+    const parent = input.folderId ? String(input.folderId).replace(/'/g, "\\'") : "root";
+    const q = `'${parent}' in parents and trashed = false`;
+    const res = await fetch(
+      `https://www.googleapis.com/drive/v3/files?q=${encodeURIComponent(q)}&fields=files(id,name,mimeType,modifiedTime)&pageSize=100&orderBy=folder,name`,
+      { headers: authHeaders },
+    );
+    if (!res.ok) return { error: `Folder listing failed (${res.status})` };
     return await res.json();
   }
 
@@ -204,22 +232,34 @@ async function runGoogleTool(
     if (!metaRes.ok) return { error: `Could not read file metadata (${metaRes.status})` };
     const meta = await metaRes.json();
 
+    const exportMimeType: Record<string, string> = {
+      "application/vnd.google-apps.document": "text/plain",
+      "application/vnd.google-apps.spreadsheet": "text/csv",
+      "application/vnd.google-apps.presentation": "text/plain",
+    };
+    const readableDirectly = new Set([
+      "text/plain",
+      "text/markdown",
+      "text/csv",
+      "text/html",
+      "application/json",
+    ]);
+
     let contentRes: Response;
-    if (meta.mimeType === "application/vnd.google-apps.document") {
+    if (exportMimeType[meta.mimeType]) {
       contentRes = await fetch(
-        `https://www.googleapis.com/drive/v3/files/${fileId}/export?mimeType=text/plain`,
+        `https://www.googleapis.com/drive/v3/files/${fileId}/export?mimeType=${encodeURIComponent(exportMimeType[meta.mimeType])}`,
         { headers: authHeaders },
       );
-    } else if (meta.mimeType === "application/vnd.google-apps.spreadsheet") {
-      contentRes = await fetch(
-        `https://www.googleapis.com/drive/v3/files/${fileId}/export?mimeType=text/csv`,
-        { headers: authHeaders },
-      );
-    } else {
+    } else if (readableDirectly.has(meta.mimeType)) {
       contentRes = await fetch(
         `https://www.googleapis.com/drive/v3/files/${fileId}?alt=media`,
         { headers: authHeaders },
       );
+    } else {
+      return {
+        error: `"${meta.name}" is a ${meta.mimeType} file. gadf can currently only read Google Docs/Sheets/Slides and plain text/Markdown/CSV/JSON/HTML files — not PDFs, Word/Excel/PowerPoint files, images, or other binary formats.`,
+      };
     }
     if (!contentRes.ok) return { error: `Could not read file content (${contentRes.status})` };
     const text = await contentRes.text();
