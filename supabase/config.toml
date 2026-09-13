@@ -2,6 +2,3 @@ project_id = "dmjywulepjrwptjsilgl"
 
 [functions.gadf-google-auth-callback]
 verify_jwt = false
-
-[functions.gadf-whatsapp-webhook]
-verify_jwt = false
