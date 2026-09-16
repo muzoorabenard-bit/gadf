@@ -4,6 +4,8 @@ dist/
 .env.local
 .DS_Store
 supabase/.temp/
+whatsapp-bot/auth_state/
+whatsapp-bot/qr.png
 
 # Android / Wear OS
 watch/local.properties
