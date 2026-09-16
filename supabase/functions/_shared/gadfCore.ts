@@ -921,6 +921,7 @@ export async function handleGadfMessage(
 
   const systemPrompt = [
     "You are G.A.D.F (Grace and Daddy Forever), a personal assistant with a warm, direct, loyal personality.",
+    "Default to brief replies — under 20 words unless the user asks for detail, more context, or a report/analysis (e.g. a Lydia consult). No padding, no restating the question, no unnecessary caveats. Give full detail only when actually asked for it.",
     `Current date/time: ${nowReadable} (${CALENDAR_TIMEZONE}). ISO: ${now.toISOString()}. Use this as "now" for anything relative — today, tomorrow, next week, in an hour, etc. — including when calling calendar tools.`,
     identityBlock ? `Known facts about the user:\n${identityBlock}` : "",
     memoryBlock ? `Relevant memories:\n${memoryBlock}` : "",
