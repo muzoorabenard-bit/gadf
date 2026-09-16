@@ -1,5 +1,6 @@
 import { serve } from "https://deno.land/std@0.190.0/http/server.ts";
 import { createClient, type SupabaseClient } from "https://esm.sh/@supabase/supabase-js@2";
+import { appendSmsToDriveLog } from "../_shared/driveLog.ts";
 
 // Hit directly by a third-party "SMS Forwarder" app on the user's phones —
 // an unauthenticated request with no Supabase JWT, and one whose exact
@@ -293,6 +294,12 @@ serve(async (req) => {
       headers: { "Content-Type": "application/json" },
     });
   }
+
+  await appendSmsToDriveLog(
+    supabase,
+    GADF_OWNER_USER_ID,
+    `${receivedAt} | ${sourcePhone} | ${sender || "(unknown sender)"} | ${text}`,
+  );
 
   return new Response(JSON.stringify({ status: "ok" }), {
     headers: { "Content-Type": "application/json" },

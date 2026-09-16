@@ -36,7 +36,7 @@ async function embed(text: string): Promise<number[]> {
 
 // ── Google Drive ─────────────────────────────────────────────────────────
 
-async function getGoogleAccessToken(supabase: SupabaseClient, userId: string): Promise<string | null> {
+export async function getGoogleAccessToken(supabase: SupabaseClient, userId: string): Promise<string | null> {
   const { data: tokenRow } = await supabase
     .from("google_tokens")
     .select("access_token, refresh_token, expires_at")
