@@ -51,6 +51,32 @@ async function askGadf(message: string): Promise<string> {
   return data?.reply || "...";
 }
 
+// Baileys represents each message type under a different key -- plain text
+// is the easy case, but an image/voice note/sticker/etc. with no caption
+// has no `.conversation` or `.extendedTextMessage.text` at all. Missing
+// those meant Dero silently dropped non-text messages entirely (not even
+// logging that one arrived), which is how a real unread message went
+// missing from whatsapp_pending_messages. Falls back to a readable
+// placeholder for anything without extractable text.
+// deno-lint-ignore no-explicit-any
+function extractMessageText(message: any): string {
+  return (
+    message.conversation ??
+    message.extendedTextMessage?.text ??
+    message.imageMessage?.caption ??
+    message.videoMessage?.caption ??
+    message.documentMessage?.caption ??
+    (message.imageMessage ? "[image]" : undefined) ??
+    (message.videoMessage ? "[video]" : undefined) ??
+    (message.audioMessage ? (message.audioMessage.ptt ? "[voice note]" : "[audio]") : undefined) ??
+    (message.stickerMessage ? "[sticker]" : undefined) ??
+    (message.documentMessage ? `[document: ${message.documentMessage.fileName ?? "file"}]` : undefined) ??
+    (message.locationMessage ? "[location]" : undefined) ??
+    (message.contactMessage ? `[contact card: ${message.contactMessage.displayName ?? ""}]` : undefined) ??
+    ""
+  );
+}
+
 // Dero: archives every 1:1 conversation (not the self-chat control channel)
 // into whatsapp_contacts/whatsapp_messages so gadf has context on anyone
 // the user talks to. remoteJidAlt resolves the same @lid-vs-phone-number
@@ -197,10 +223,10 @@ async function connect(): Promise<void> {
       const remoteJidAlt = (m.key as { remoteJidAlt?: string }).remoteJidAlt;
       const isSelfChat = m.key.remoteJid === selfJid || remoteJidAlt === selfJid;
 
-      const text = m.message.conversation ?? m.message.extendedTextMessage?.text ?? "";
-      if (!text.trim()) continue;
-
       if (isSelfChat) {
+        const text = m.message.conversation ?? m.message.extendedTextMessage?.text ?? "";
+        if (!text.trim()) continue;
+
         console.log("You:", text);
         const reply = await askGadf(text);
         console.log("gadf:", reply);
@@ -212,6 +238,8 @@ async function connect(): Promise<void> {
 
       // Dero: archive every other 1:1 chat (skip groups and channels/newsletters).
       if (m.key.remoteJid.endsWith("@g.us") || m.key.remoteJid.endsWith("@newsletter")) continue;
+      const text = extractMessageText(m.message);
+      if (!text) continue;
       const occurredAt = m.messageTimestamp
         ? new Date(Number(m.messageTimestamp) * 1000).toISOString()
         : new Date().toISOString();
