@@ -7,6 +7,7 @@ import {
   getBusinessFinancials,
   getProjectFinancials,
 } from "./financeEngine.ts";
+import { searchContactsByName } from "./googleContacts.ts";
 
 const ANTHROPIC_API_KEY = Deno.env.get("ANTHROPIC_API_KEY")!;
 const GEMINI_API_KEY = Deno.env.get("GEMINI_API_KEY")!;
@@ -842,12 +843,35 @@ async function resolveContact(
 
   const { data, error } = await dbQuery.limit(5);
   if (error) return { error: `Could not look up contact: ${error.message}` };
-  if (!data || data.length === 0) return { error: `No contact found matching "${query}"` };
-  if (data.length > 1) {
+  if (data && data.length === 1) return { contact: data[0] };
+  if (data && data.length > 1) {
     const names = data.map((c) => c.display_name || c.phone_number).join(", ");
     return { error: `Multiple contacts match "${query}": ${names} — ask the user which one they mean` };
   }
-  return { contact: data[0] };
+
+  // No WhatsApp history with this person yet — fall back to Google Contacts
+  // so a first message can still be sent, and remember them for next time.
+  const token = await getGoogleAccessToken(supabase, userId);
+  if (!token) return { error: `No contact found matching "${query}" (and Google isn't connected to check Contacts)` };
+
+  const matches = await searchContactsByName(token, query);
+  if (matches.length === 0) return { error: `No contact found matching "${query}" in WhatsApp history or Google Contacts` };
+  if (matches.length > 1) {
+    const names = matches.map((m) => `${m.name} (${m.phoneNumber})`).join(", ");
+    return { error: `Multiple Google contacts match "${query}": ${names} — ask the user which one they mean` };
+  }
+
+  const digits = matches[0].phoneNumber.replace(/\D/g, "");
+  const { data: created, error: createError } = await supabase
+    .from("whatsapp_contacts")
+    .upsert(
+      { user_id: userId, jid: `${digits}@s.whatsapp.net`, phone_number: digits, display_name: matches[0].name },
+      { onConflict: "user_id,jid" },
+    )
+    .select("id, display_name, phone_number")
+    .single();
+  if (createError) return { error: `Found ${matches[0].name} in Google Contacts but couldn't save them: ${createError.message}` };
+  return { contact: created };
 }
 
 const whatsappTools = [

@@ -19,3 +19,24 @@ export async function lookupContactByPhone(token: string, phoneNumber: string): 
   }
   return null;
 }
+
+// The reverse lookup: find a contact's phone number by name, used when the
+// user tells gadf to text someone Dero has no WhatsApp history with yet.
+export async function searchContactsByName(token: string, name: string): Promise<Array<{ name: string; phoneNumber: string }>> {
+  const res = await fetch(
+    `https://people.googleapis.com/v1/people:searchContacts?query=${encodeURIComponent(name)}&readMask=names,phoneNumbers`,
+    { headers: { Authorization: `Bearer ${token}` } },
+  );
+  if (!res.ok) {
+    console.error("People API search failed:", await res.text());
+    return [];
+  }
+  const data = await res.json();
+  const matches: Array<{ name: string; phoneNumber: string }> = [];
+  for (const result of data.results ?? []) {
+    const displayName = result.person?.names?.[0]?.displayName;
+    const phoneNumber = result.person?.phoneNumbers?.[0]?.canonicalForm ?? result.person?.phoneNumbers?.[0]?.value;
+    if (displayName && phoneNumber) matches.push({ name: displayName, phoneNumber });
+  }
+  return matches;
+}
