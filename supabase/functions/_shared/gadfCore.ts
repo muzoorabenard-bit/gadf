@@ -7,7 +7,7 @@ import {
   getBusinessFinancials,
   getProjectFinancials,
 } from "./financeEngine.ts";
-import { searchContactsByName } from "./googleContacts.ts";
+import { searchContactsByName, lookupContactByPhone } from "./googleContacts.ts";
 
 const ANTHROPIC_API_KEY = Deno.env.get("ANTHROPIC_API_KEY")!;
 const GEMINI_API_KEY = Deno.env.get("GEMINI_API_KEY")!;
@@ -854,23 +854,42 @@ async function resolveContact(
   const token = await getGoogleAccessToken(supabase, userId);
   if (!token) return { error: `No contact found matching "${query}" (and Google isn't connected to check Contacts)` };
 
-  const matches = await searchContactsByName(token, query);
-  if (matches.length === 0) return { error: `No contact found matching "${query}" in WhatsApp history or Google Contacts` };
-  if (matches.length > 1) {
-    const names = matches.map((m) => `${m.name} (${m.phoneNumber})`).join(", ");
-    return { error: `Multiple Google contacts match "${query}": ${names} — ask the user which one they mean` };
+  const isPhoneQuery = digitsOnly.length >= 6;
+  let resolvedName: string;
+  let resolvedPhone: string;
+
+  if (isPhoneQuery) {
+    // A specific number (e.g. the user picked one of several same-named
+    // contacts and gave/confirmed a number) — match by phone, not name, so
+    // this doesn't re-trigger the same name ambiguity all over again.
+    const name = await lookupContactByPhone(token, digitsOnly);
+    if (!name) return { error: `No contact found with number "${query}" in WhatsApp history or Google Contacts` };
+    resolvedName = name;
+    resolvedPhone = digitsOnly;
+  } else {
+    const matches = await searchContactsByName(token, query);
+    if (matches.length === 0) return { error: `No contact found matching "${query}" in WhatsApp history or Google Contacts` };
+    if (matches.length > 1) {
+      const names = matches.map((m) => `${m.name} (${m.phoneNumber})`).join(", ");
+      return {
+        error:
+          `Multiple Google contacts match "${query}": ${names} — ask the user which one they mean, then call this ` +
+          "again with that specific phone number as the contact, not the name, so it resolves unambiguously.",
+      };
+    }
+    resolvedName = matches[0].name;
+    resolvedPhone = matches[0].phoneNumber.replace(/\D/g, "");
   }
 
-  const digits = matches[0].phoneNumber.replace(/\D/g, "");
   const { data: created, error: createError } = await supabase
     .from("whatsapp_contacts")
     .upsert(
-      { user_id: userId, jid: `${digits}@s.whatsapp.net`, phone_number: digits, display_name: matches[0].name },
+      { user_id: userId, jid: `${resolvedPhone}@s.whatsapp.net`, phone_number: resolvedPhone, display_name: resolvedName },
       { onConflict: "user_id,jid" },
     )
     .select("id, display_name, phone_number")
     .single();
-  if (createError) return { error: `Found ${matches[0].name} in Google Contacts but couldn't save them: ${createError.message}` };
+  if (createError) return { error: `Found ${resolvedName} in Google Contacts but couldn't save them: ${createError.message}` };
   return { contact: created };
 }
 
@@ -897,7 +916,7 @@ const whatsappTools = [
   {
     name: "whatsapp_send_message",
     description:
-      "Send a WhatsApp message to a contact. CRITICAL: only call this after the user has explicitly approved this exact text in their immediately preceding message — never call it to send your own first draft. This applies even to messages toward an active conversation objective; there are no exceptions, ever.",
+      "Send a WhatsApp message to a contact. CRITICAL: only call this after the user has explicitly approved this exact text in their immediately preceding message — never call it to send your own first draft. This applies even to messages toward an active conversation objective; there are no exceptions, ever. If `contact` was ambiguous (multiple people share a name) and the user already told you which one, pass their specific phone number here, not the name again. This tool can fail (contact not found, ambiguous, or a real send error) — check the result before telling the user it sent; if it returned an error, tell them it failed and why, never say 'Sent' unless the result actually confirms it.",
     input_schema: {
       type: "object",
       properties: {

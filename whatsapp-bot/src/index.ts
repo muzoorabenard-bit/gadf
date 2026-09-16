@@ -210,8 +210,8 @@ async function connect(): Promise<void> {
         continue;
       }
 
-      // Dero: archive every other 1:1 chat (skip groups) in both directions.
-      if (m.key.remoteJid.endsWith("@g.us")) continue;
+      // Dero: archive every other 1:1 chat (skip groups and channels/newsletters).
+      if (m.key.remoteJid.endsWith("@g.us") || m.key.remoteJid.endsWith("@newsletter")) continue;
       const occurredAt = m.messageTimestamp
         ? new Date(Number(m.messageTimestamp) * 1000).toISOString()
         : new Date().toISOString();
