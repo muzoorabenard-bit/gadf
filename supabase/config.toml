@@ -1,3 +1,4 @@
+# Deployed automatically by .github/workflows/deploy-supabase.yml on push to main.
 project_id = "dmjywulepjrwptjsilgl"
 
 [functions.gadf-google-auth-callback]
