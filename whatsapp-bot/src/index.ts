@@ -247,10 +247,25 @@ async function connect(): Promise<void> {
         continue;
       }
 
-      // Dero: archive every other 1:1 chat (skip groups and channels/newsletters).
-      if (m.key.remoteJid.endsWith("@g.us") || m.key.remoteJid.endsWith("@newsletter")) continue;
+      // Dero: archive genuine 1:1 chats only. `participant` being set is
+      // the reliable signal for "this isn't really a 1:1 message" (groups,
+      // broadcast lists, status replies) regardless of what remoteJid looks
+      // like -- suffix checks alone let one through once with a fabricated-
+      // looking result, so this is belt-and-suspenders on top of them.
+      if (
+        m.key.remoteJid.endsWith("@g.us") ||
+        m.key.remoteJid.endsWith("@newsletter") ||
+        m.key.remoteJid.endsWith("@broadcast") ||
+        m.key.participant
+      ) {
+        console.log(
+          `[dero] skipped non-1:1 message — remoteJid=${m.key.remoteJid} participant=${m.key.participant ?? "none"} type=${type}`,
+        );
+        continue;
+      }
       const text = extractMessageText(m.message);
       if (!text) continue;
+      console.log(`[dero] capturing — remoteJid=${m.key.remoteJid} remoteJidAlt=${remoteJidAlt ?? "none"} fromMe=${m.key.fromMe} type=${type}`);
       const occurredAt = m.messageTimestamp
         ? new Date(Number(m.messageTimestamp) * 1000).toISOString()
         : new Date().toISOString();
