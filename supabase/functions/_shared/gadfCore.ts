@@ -832,14 +832,28 @@ async function consultLydia(supabase: SupabaseClient, userId: string): Promise<s
 
 // ── Dero: WhatsApp contact archive, triage, and approved sending ──────────
 
+// Local Ugandan numbers are commonly written/saved as "0771234567" (trunk
+// prefix, no country code) while WhatsApp JIDs and everything already
+// stored here use the full "256771234567" form -- normalize so a locally-
+// formatted number still matches/creates the right contact instead of
+// silently building a JID nobody can receive.
+function normalizeUgandaDigits(raw: string): string {
+  const digits = raw.replace(/\D/g, "");
+  if (digits.startsWith("256")) return digits;
+  if (digits.startsWith("0") && digits.length === 10) return `256${digits.slice(1)}`;
+  return digits;
+}
+
 async function resolveContact(
   supabase: SupabaseClient,
   userId: string,
   query: string,
 ): Promise<{ contact?: { id: string; display_name: string | null; phone_number: string | null }; error?: string }> {
-  const digitsOnly = query.replace(/\D/g, "");
+  const rawDigits = query.replace(/\D/g, "");
+  const isPhoneQuery = rawDigits.length >= 6;
+  const digitsOnly = isPhoneQuery ? normalizeUgandaDigits(query) : rawDigits;
   let dbQuery = supabase.from("whatsapp_contacts").select("id, display_name, phone_number").eq("user_id", userId);
-  dbQuery = digitsOnly.length >= 6 ? dbQuery.ilike("phone_number", `%${digitsOnly}%`) : dbQuery.ilike("display_name", `%${query}%`);
+  dbQuery = isPhoneQuery ? dbQuery.ilike("phone_number", `%${digitsOnly}%`) : dbQuery.ilike("display_name", `%${query}%`);
 
   const { data, error } = await dbQuery.limit(5);
   if (error) return { error: `Could not look up contact: ${error.message}` };
@@ -854,7 +868,6 @@ async function resolveContact(
   const token = await getGoogleAccessToken(supabase, userId);
   if (!token) return { error: `No contact found matching "${query}" (and Google isn't connected to check Contacts)` };
 
-  const isPhoneQuery = digitsOnly.length >= 6;
   let resolvedName: string;
   let resolvedPhone: string;
 
@@ -878,7 +891,7 @@ async function resolveContact(
       };
     }
     resolvedName = matches[0].name;
-    resolvedPhone = matches[0].phoneNumber.replace(/\D/g, "");
+    resolvedPhone = normalizeUgandaDigits(matches[0].phoneNumber);
   }
 
   const { data: created, error: createError } = await supabase
