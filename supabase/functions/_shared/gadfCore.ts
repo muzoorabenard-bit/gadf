@@ -1,4 +1,12 @@
 import { type SupabaseClient } from "https://esm.sh/@supabase/supabase-js@2";
+import {
+  getAccountBalances,
+  getIncomeExpense,
+  calculateSafeToSpend,
+  getCategorySpending,
+  getBusinessFinancials,
+  getProjectFinancials,
+} from "./financeEngine.ts";
 
 const ANTHROPIC_API_KEY = Deno.env.get("ANTHROPIC_API_KEY")!;
 const GEMINI_API_KEY = Deno.env.get("GEMINI_API_KEY")!;
@@ -479,6 +487,103 @@ const financeTools = [
       },
     },
   },
+  {
+    name: "finance_safe_to_spend",
+    description:
+      "Calculate how much of the user's cash is genuinely discretionary right now: total cash across accounts, minus business/project funds, minus pending commitments, minus configured essential expenses and protected reserve. Returns every component of the calculation, not just the final number — always show the breakdown, not a bare figure.",
+    input_schema: { type: "object", properties: {} },
+  },
+  {
+    name: "finance_account_balances",
+    description: "Get the current balance of each of the user's financial accounts (e.g. each MTN Mobile Money number), as of their most recent transaction.",
+    input_schema: { type: "object", properties: {} },
+  },
+  {
+    name: "finance_category_spending",
+    description: "Get spending totals grouped by category over a date range, largest first.",
+    input_schema: {
+      type: "object",
+      properties: {
+        startDate: { type: "string", description: "ISO date, inclusive" },
+        endDate: { type: "string", description: "ISO date, exclusive" },
+      },
+    },
+  },
+  {
+    name: "finance_business_project_summary",
+    description: "Get cash received/spent/position for each of the user's businesses and projects. Call this when asked about a specific business or project, or 'what's making money'. Labeled as cash position, not profit, since it isn't full accrual accounting.",
+    input_schema: { type: "object", properties: {} },
+  },
+  {
+    name: "finance_add_commitment",
+    description: "Record a known upcoming financial obligation (e.g. rent due, a bill) so it's accounted for in safe-to-spend and commitment totals.",
+    input_schema: {
+      type: "object",
+      properties: {
+        description: { type: "string" },
+        amount: { type: "number" },
+        dueDate: { type: "string", description: "ISO date, optional" },
+      },
+      required: ["description", "amount"],
+    },
+  },
+  {
+    name: "finance_add_receivable",
+    description: "Record money someone owes the user, so it's tracked separately from cash they actually have.",
+    input_schema: {
+      type: "object",
+      properties: {
+        description: { type: "string" },
+        amount: { type: "number" },
+        counterparty: { type: "string" },
+        expectedDate: { type: "string", description: "ISO date, optional" },
+      },
+      required: ["description", "amount", "counterparty"],
+    },
+  },
+  {
+    name: "finance_create_business",
+    description: "Create a new business the user runs, so transactions can be allocated to it.",
+    input_schema: {
+      type: "object",
+      properties: { name: { type: "string" } },
+      required: ["name"],
+    },
+  },
+  {
+    name: "finance_create_project",
+    description: "Create a new project (optionally under a business), so transactions can be allocated to it.",
+    input_schema: {
+      type: "object",
+      properties: {
+        name: { type: "string" },
+        businessId: { type: "string", description: "Optional — id of the business this project belongs to" },
+      },
+      required: ["name"],
+    },
+  },
+  {
+    name: "finance_correct_transaction",
+    description: "Correct a transaction's classification when the user tells you it's wrong — e.g. wrong category, actually a business expense, actually a transfer between their own accounts. Find the transaction first with finance_search_transactions if you don't already have its id.",
+    input_schema: {
+      type: "object",
+      properties: {
+        transactionId: { type: "string" },
+        categoryName: { type: "string", description: "New category, existing or new" },
+        purposeType: { type: "string", enum: ["personal", "business", "mixed", "unknown"] },
+        businessId: { type: "string" },
+        projectId: { type: "string" },
+        isTransfer: { type: "boolean", description: "True if this is a transfer between the user's own accounts, not real income/expense" },
+      },
+      required: ["transactionId"],
+    },
+  },
+  {
+    name: "consult_lydia",
+    description:
+      "Ask Lydia, the user's financial analyst sub-agent, for a report on their current financial state — call this whenever the user asks how they're doing financially, or on a scheduled check-in. Lydia gathers the real numbers herself and returns a written analysis; relay/interpret her report in your own voice rather than just pasting it verbatim.",
+    input_schema: { type: "object", properties: {} },
+  },
 ];
 
 async function runFinanceTool(
@@ -535,7 +640,193 @@ async function runFinanceTool(
     return { transactions: data };
   }
 
+  if (name === "finance_safe_to_spend") {
+    return await calculateSafeToSpend(supabase, userId);
+  }
+
+  if (name === "finance_account_balances") {
+    return { accounts: await getAccountBalances(supabase, userId) };
+  }
+
+  if (name === "finance_category_spending") {
+    const categories = await getCategorySpending(
+      supabase,
+      userId,
+      input.startDate ? String(input.startDate) : undefined,
+      input.endDate ? String(input.endDate) : undefined,
+    );
+    return { categories };
+  }
+
+  if (name === "finance_business_project_summary") {
+    const [businesses, projects] = await Promise.all([
+      getBusinessFinancials(supabase, userId),
+      getProjectFinancials(supabase, userId),
+    ]);
+    return { businesses, projects };
+  }
+
+  if (name === "finance_add_commitment") {
+    const { data, error } = await supabase
+      .from("commitments")
+      .insert({
+        user_id: userId,
+        description: String(input.description),
+        amount: Number(input.amount),
+        due_date: input.dueDate ? String(input.dueDate) : null,
+      })
+      .select("id")
+      .single();
+    if (error) return { error: `Could not add commitment: ${error.message}` };
+    return { added: true, commitmentId: data.id };
+  }
+
+  if (name === "finance_add_receivable") {
+    const { data, error } = await supabase
+      .from("receivables")
+      .insert({
+        user_id: userId,
+        description: String(input.description),
+        amount: Number(input.amount),
+        counterparty: String(input.counterparty),
+        expected_date: input.expectedDate ? String(input.expectedDate) : null,
+      })
+      .select("id")
+      .single();
+    if (error) return { error: `Could not add receivable: ${error.message}` };
+    return { added: true, receivableId: data.id };
+  }
+
+  if (name === "finance_create_business") {
+    const { data, error } = await supabase
+      .from("businesses")
+      .insert({ user_id: userId, name: String(input.name) })
+      .select("id")
+      .single();
+    if (error) return { error: `Could not create business: ${error.message}` };
+    return { created: true, businessId: data.id };
+  }
+
+  if (name === "finance_create_project") {
+    const { data, error } = await supabase
+      .from("projects")
+      .insert({ user_id: userId, name: String(input.name), business_id: input.businessId ? String(input.businessId) : null })
+      .select("id")
+      .single();
+    if (error) return { error: `Could not create project: ${error.message}` };
+    return { created: true, projectId: data.id };
+  }
+
+  if (name === "finance_correct_transaction") {
+    // deno-lint-ignore no-explicit-any
+    const update: Record<string, any> = {};
+    if (input.purposeType) update.purpose_type = input.purposeType;
+    if (input.businessId) update.business_id = input.businessId;
+    if (input.projectId) update.project_id = input.projectId;
+    if (typeof input.isTransfer === "boolean") update.is_transfer = input.isTransfer;
+
+    if (input.categoryName) {
+      const { data: existing } = await supabase
+        .from("categories")
+        .select("id")
+        .eq("user_id", userId)
+        .ilike("name", String(input.categoryName))
+        .limit(1)
+        .maybeSingle();
+      if (existing) {
+        update.category_id = existing.id;
+      } else {
+        const { data: created, error: catError } = await supabase
+          .from("categories")
+          .insert({ user_id: userId, name: String(input.categoryName), kind: input.purposeType === "business" ? "business" : "personal" })
+          .select("id")
+          .single();
+        if (catError) return { error: `Could not create category: ${catError.message}` };
+        update.category_id = created.id;
+      }
+    }
+
+    if (Object.keys(update).length === 0) return { error: "Nothing to update — provide at least one field to correct" };
+
+    const { error } = await supabase
+      .from("transactions")
+      .update(update)
+      .eq("id", String(input.transactionId))
+      .eq("user_id", userId);
+    if (error) return { error: `Could not correct transaction: ${error.message}` };
+    return { corrected: true };
+  }
+
+  if (name === "consult_lydia") {
+    return { report: await consultLydia(supabase, userId) };
+  }
+
   return { error: `Unknown tool ${name}` };
+}
+
+async function consultLydia(supabase: SupabaseClient, userId: string): Promise<string> {
+  const now = new Date();
+  const monthStart = new Date(now.getFullYear(), now.getMonth(), 1).toISOString();
+
+  const [balances, monthActivity, safeToSpend, categorySpending, businessProjects, commitmentsTotal, receivablesTotal, recentTx] =
+    await Promise.all([
+      getAccountBalances(supabase, userId),
+      getIncomeExpense(supabase, userId, monthStart),
+      calculateSafeToSpend(supabase, userId),
+      getCategorySpending(supabase, userId, monthStart),
+      Promise.all([getBusinessFinancials(supabase, userId), getProjectFinancials(supabase, userId)]),
+      supabase.from("commitments").select("description, amount, due_date").eq("user_id", userId).eq("status", "pending"),
+      supabase.from("receivables").select("description, amount, counterparty, expected_date").eq("user_id", userId).eq("status", "pending"),
+      supabase
+        .from("transactions")
+        .select("transaction_type, amount, counterparty, occurred_at")
+        .eq("user_id", userId)
+        .eq("parse_status", "parsed")
+        .order("occurred_at", { ascending: false })
+        .limit(10),
+    ]);
+
+  const financialState = {
+    asOf: now.toISOString(),
+    accountBalances: balances,
+    thisMonth: monthActivity,
+    safeToSpend,
+    categorySpendingThisMonth: categorySpending,
+    businesses: businessProjects[0],
+    projects: businessProjects[1],
+    pendingCommitments: commitmentsTotal.data ?? [],
+    pendingReceivables: receivablesTotal.data ?? [],
+    recentTransactions: recentTx.data ?? [],
+  };
+
+  const res = await fetch("https://api.anthropic.com/v1/messages", {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      "x-api-key": ANTHROPIC_API_KEY,
+      "anthropic-version": "2023-06-01",
+    },
+    body: JSON.stringify({
+      model: "claude-sonnet-5",
+      max_tokens: 1024,
+      system: [
+        "You are Lydia, a personal financial analyst. You report to G.A.D.F (gadf), who relays your analysis to the user — you never talk to the user directly.",
+        "You are calm, factual, concise, and non-judgmental. State what changed and by how much rather than passing judgment (\"transport spending rose from X to Y\", not \"you were irresponsible\"). No exclamation marks, no emoji, no congratulations.",
+        "Every number in the JSON below was already calculated deterministically from real transaction data — you are not doing arithmetic, only explaining it. Never invent a figure, transaction, balance, client, or commitment that isn't in this data. If something needed to answer well isn't present, say so plainly rather than guessing.",
+        "Cover, briefly: current cash position, this month's income/expense/net, safe-to-spend (with its components, not just the final number), notable category spending, any business/project activity, pending commitments and receivables, and anything that stands out.",
+        `Financial state:\n${JSON.stringify(financialState, null, 2)}`,
+      ].join("\n\n"),
+      messages: [{ role: "user", content: "Give me your current report." }],
+    }),
+  });
+
+  if (!res.ok) {
+    console.error("Lydia consult failed:", await res.text());
+    return "I tried to consult Lydia but the call to her failed — try again in a moment.";
+  }
+  const data = await res.json();
+  const textBlock = (data.content ?? []).find((b: { type: string; text?: string }) => b.type === "text");
+  return textBlock?.text ?? "Lydia didn't return a report this time.";
 }
 
 // ── Shared core — used by both the web chat function and the WhatsApp webhook ──
@@ -640,7 +931,7 @@ export async function handleGadfMessage(
     channel === "whatsapp"
       ? "This message came in over WhatsApp — keep replies concise and readable on a phone screen; avoid long tables or heavy markdown."
       : "",
-    "You act as the user's accountant for their MTN Mobile Money activity. Transactions are captured automatically from SMS forwarded off their phones — the user never enters these manually, and you have no way to record a transaction yourself. Use finance_summary for totals/trends over a period and finance_search_transactions to look up specific transactions. Some messages may fail to parse (parse_status 'failed' isn't returned by these tools, so a gap in the numbers may mean an unparsed message, not that nothing happened) — mention that possibility if a total looks off rather than stating it with full confidence.",
+    "For anything financial, you work with Lydia, the user's financial analyst — call consult_lydia and relay/interpret her report rather than just pasting it. Transactions themselves are captured automatically from mobile money SMS forwarded off the user's phones; you have no way to record a transaction yourself. You can use finance_summary/finance_search_transactions/finance_account_balances/finance_safe_to_spend/finance_category_spending/finance_business_project_summary directly for quick lookups without going through Lydia when that's simpler. You can also finance_add_commitment, finance_add_receivable, finance_create_business, finance_create_project, and finance_correct_transaction when the user tells you about an obligation, money owed to them, a new business/project, or that a transaction was misclassified. Some messages may fail to parse, so a gap in the numbers may mean an unparsed message, not that nothing happened — mention that possibility if a total looks off rather than stating it with full confidence.",
     "You do not yet have tool access to email, contacts, or maps, and you can't send a WhatsApp message on your own initiative (only reply to one) — that arrives in a later build phase. If asked to perform one of those actions, say so plainly instead of pretending to do it.",
   ]
     .filter(Boolean)
@@ -687,7 +978,7 @@ export async function handleGadfMessage(
     const toolResults = [];
     for (const toolUse of toolUseBlocks) {
       const isCodingTool = toolUse.name === "queue_coding_task";
-      const isFinanceTool = toolUse.name === "finance_summary" || toolUse.name === "finance_search_transactions";
+      const isFinanceTool = toolUse.name.startsWith("finance_") || toolUse.name === "consult_lydia";
       const result = isCodingTool
         ? await runCodingTool(toolUse.name, toolUse.input, supabase, userId)
         : isFinanceTool

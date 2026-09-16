@@ -9,3 +9,6 @@ verify_jwt = false
 
 [functions.gadf-sms-ingest]
 verify_jwt = false
+
+[functions.gadf-scheduled-report]
+verify_jwt = false

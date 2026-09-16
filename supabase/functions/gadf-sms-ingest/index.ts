@@ -1,5 +1,5 @@
 import { serve } from "https://deno.land/std@0.190.0/http/server.ts";
-import { createClient } from "https://esm.sh/@supabase/supabase-js@2";
+import { createClient, type SupabaseClient } from "https://esm.sh/@supabase/supabase-js@2";
 
 // Hit directly by a third-party "SMS Forwarder" app on the user's phones —
 // an unauthenticated request with no Supabase JWT, and one whose exact
@@ -91,9 +91,71 @@ interface ParsedTransaction {
   balance_after: number | null;
   transaction_ref: string | null;
   occurred_at: string | null;
+  category_name: string | null;
+  category_confidence: number | null;
+  purpose_type: "personal" | "business" | "mixed" | "unknown";
 }
 
-async function parseTransaction(smsText: string, receivedAt: string): Promise<ParsedTransaction | null> {
+async function resolveAccount(
+  supabase: SupabaseClient,
+  userId: string,
+  sourcePhone: string,
+): Promise<string | null> {
+  const { data: existing } = await supabase
+    .from("financial_accounts")
+    .select("id")
+    .eq("user_id", userId)
+    .eq("source_phone", sourcePhone)
+    .maybeSingle();
+  if (existing) return existing.id;
+
+  const { data: created, error } = await supabase
+    .from("financial_accounts")
+    .insert({ user_id: userId, name: `MTN MoMo (${sourcePhone})`, type: "mobile_money", source_phone: sourcePhone })
+    .select("id")
+    .single();
+  if (error) {
+    console.error("Could not create financial account:", error);
+    return null;
+  }
+  return created.id;
+}
+
+async function resolveCategory(
+  supabase: SupabaseClient,
+  userId: string,
+  categoryName: string | null,
+  purposeType: string,
+): Promise<string | null> {
+  if (!categoryName) return null;
+
+  const { data: existing } = await supabase
+    .from("categories")
+    .select("id")
+    .eq("user_id", userId)
+    .ilike("name", categoryName)
+    .limit(1)
+    .maybeSingle();
+  if (existing) return existing.id;
+
+  const kind = purposeType === "business" ? "business" : "personal";
+  const { data: created, error } = await supabase
+    .from("categories")
+    .insert({ user_id: userId, name: categoryName, kind })
+    .select("id")
+    .single();
+  if (error) {
+    console.error("Could not create category:", error);
+    return null;
+  }
+  return created.id;
+}
+
+async function parseTransaction(
+  smsText: string,
+  receivedAt: string,
+  knownCategoryNames: string[],
+): Promise<ParsedTransaction | null> {
   const res = await fetch("https://api.anthropic.com/v1/messages", {
     method: "POST",
     headers: {
@@ -106,7 +168,9 @@ async function parseTransaction(smsText: string, receivedAt: string): Promise<Pa
       max_tokens: 512,
       system:
         `Extract structured data from an MTN Mobile Money SMS. The message was received at ${receivedAt} (use this to resolve relative/partial dates in the SMS, e.g. a time with no date). ` +
-        "Always call record_transaction, even if some fields are unknown (use null). If this text is not actually a mobile money transaction notification, call record_transaction with transaction_type \"other\" and amount null.",
+        "Always call record_transaction, even if some fields are unknown (use null). If this text is not actually a mobile money transaction notification, call record_transaction with transaction_type \"other\" and amount null.\n\n" +
+        `The user's existing categories are: ${knownCategoryNames.length ? knownCategoryNames.join(", ") : "(none yet)"}. ` +
+        "Prefer reusing an existing category over inventing a similar new one. purpose_type should be \"business\" only if the SMS clearly relates to one of the user's business activities (e.g. paying for materials, receiving a client payment) — default to \"personal\" for everyday spending, or \"unknown\" if genuinely unclear. Set category_confidence between 0 and 1 reflecting how sure you are of the category guess.",
       messages: [{ role: "user", content: smsText }],
       tools: [
         {
@@ -124,8 +188,11 @@ async function parseTransaction(smsText: string, receivedAt: string): Promise<Pa
               balance_after: { type: ["number", "null"] },
               transaction_ref: { type: ["string", "null"], description: "MTN's own transaction/reference id" },
               occurred_at: { type: ["string", "null"], description: "ISO 8601 datetime if determinable from the SMS, else null" },
+              category_name: { type: ["string", "null"], description: "Best-matching category name, existing or new" },
+              category_confidence: { type: ["number", "null"], description: "0 to 1" },
+              purpose_type: { type: "string", enum: ["personal", "business", "mixed", "unknown"] },
             },
-            required: ["transaction_type", "amount", "currency"],
+            required: ["transaction_type", "amount", "currency", "purpose_type"],
           },
         },
       ],
@@ -178,7 +245,17 @@ serve(async (req) => {
 
   const supabase = createClient(SUPABASE_URL, SERVICE_ROLE_KEY);
   const receivedAt = new Date().toISOString();
-  const parsed = await parseTransaction(text, receivedAt);
+
+  const [accountId, categoriesRes] = await Promise.all([
+    resolveAccount(supabase, GADF_OWNER_USER_ID, sourcePhone),
+    supabase.from("categories").select("name").eq("user_id", GADF_OWNER_USER_ID),
+  ]);
+  const knownCategoryNames = (categoriesRes.data ?? []).map((c) => c.name as string);
+
+  const parsed = await parseTransaction(text, receivedAt, knownCategoryNames);
+  const categoryId = parsed
+    ? await resolveCategory(supabase, GADF_OWNER_USER_ID, parsed.category_name, parsed.purpose_type)
+    : null;
 
   const { error } = await supabase.from("transactions").insert({
     user_id: GADF_OWNER_USER_ID,
@@ -196,6 +273,10 @@ serve(async (req) => {
     occurred_at: parsed?.occurred_at ?? receivedAt,
     parse_status: parsed ? "parsed" : "failed",
     parse_error: parsed ? null : "Could not extract structured fields",
+    account_id: accountId,
+    category_id: categoryId,
+    category_confidence: parsed?.category_confidence ?? null,
+    purpose_type: parsed?.purpose_type ?? "unknown",
   });
 
   if (error) {
