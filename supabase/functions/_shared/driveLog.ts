@@ -2,11 +2,48 @@ import { type SupabaseClient } from "https://esm.sh/@supabase/supabase-js@2";
 import { getGoogleAccessToken } from "./gadfCore.ts";
 
 const LOG_FILE_NAME = "GADF SMS Log.txt";
+const FOLDER_NAME = "GADF Memories";
+
+async function getOrCreateMemoriesFolder(
+  supabase: SupabaseClient,
+  userId: string,
+  token: string,
+  cachedFolderId: string | null,
+): Promise<string | null> {
+  if (cachedFolderId) return cachedFolderId;
+
+  const q = encodeURIComponent(`name = '${FOLDER_NAME}' and mimeType = 'application/vnd.google-apps.folder' and trashed = false`);
+  const searchRes = await fetch(`https://www.googleapis.com/drive/v3/files?q=${q}&fields=files(id)`, {
+    headers: { Authorization: `Bearer ${token}` },
+  });
+  if (searchRes.ok) {
+    const { files } = await searchRes.json();
+    if (files?.length) {
+      const folderId = files[0].id as string;
+      await supabase.from("financial_settings").upsert({ user_id: userId, gadf_memories_folder_id: folderId, updated_at: new Date().toISOString() });
+      return folderId;
+    }
+  }
+
+  const createRes = await fetch("https://www.googleapis.com/drive/v3/files", {
+    method: "POST",
+    headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json" },
+    body: JSON.stringify({ name: FOLDER_NAME, mimeType: "application/vnd.google-apps.folder" }),
+  });
+  if (!createRes.ok) {
+    console.error("Drive folder create failed:", await createRes.text());
+    return null;
+  }
+  const created = await createRes.json();
+  await supabase.from("financial_settings").upsert({ user_id: userId, gadf_memories_folder_id: created.id, updated_at: new Date().toISOString() });
+  return created.id as string;
+}
 
 // Best-effort mirror of raw SMS text into a single running text file in the
-// user's own Drive, so it's visible/exportable outside the database. Never
-// throws — a missing/expired Google connection or a transient Drive error
-// must not block SMS ingestion, which is the primary job of the caller.
+// user's own Drive (inside the "GADF Memories" folder), so it's
+// visible/exportable outside the database. Never throws — a missing/expired
+// Google connection or a transient Drive error must not block SMS
+// ingestion, which is the primary job of the caller.
 export async function appendSmsToDriveLog(supabase: SupabaseClient, userId: string, line: string): Promise<void> {
   try {
     const token = await getGoogleAccessToken(supabase, userId);
@@ -14,7 +51,7 @@ export async function appendSmsToDriveLog(supabase: SupabaseClient, userId: stri
 
     const { data: settings } = await supabase
       .from("financial_settings")
-      .select("sms_log_drive_file_id")
+      .select("sms_log_drive_file_id, gadf_memories_folder_id")
       .eq("user_id", userId)
       .maybeSingle();
 
@@ -40,8 +77,11 @@ export async function appendSmsToDriveLog(supabase: SupabaseClient, userId: stri
       return;
     }
 
+    const folderId = await getOrCreateMemoriesFolder(supabase, userId, token, settings?.gadf_memories_folder_id ?? null);
+
     const boundary = "gadfsmslogboundary";
-    const metadata = { name: LOG_FILE_NAME, mimeType: "text/plain" };
+    const metadata: Record<string, unknown> = { name: LOG_FILE_NAME, mimeType: "text/plain" };
+    if (folderId) metadata.parents = [folderId];
     const body =
       `--${boundary}\r\nContent-Type: application/json; charset=UTF-8\r\n\r\n${JSON.stringify(metadata)}\r\n` +
       `--${boundary}\r\nContent-Type: text/plain\r\n\r\n${updated}\r\n--${boundary}--`;
