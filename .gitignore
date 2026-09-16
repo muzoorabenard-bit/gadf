@@ -6,6 +6,7 @@ dist/
 supabase/.temp/
 whatsapp-bot/auth_state/
 whatsapp-bot/qr.png
+whatsapp-bot/bot.log
 
 # Android / Wear OS
 watch/local.properties
