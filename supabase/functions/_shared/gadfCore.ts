@@ -829,6 +829,242 @@ async function consultLydia(supabase: SupabaseClient, userId: string): Promise<s
   return textBlock?.text ?? "Lydia didn't return a report this time.";
 }
 
+// ── Dero: WhatsApp contact archive, triage, and approved sending ──────────
+
+async function resolveContact(
+  supabase: SupabaseClient,
+  userId: string,
+  query: string,
+): Promise<{ contact?: { id: string; display_name: string | null; phone_number: string | null }; error?: string }> {
+  const digitsOnly = query.replace(/\D/g, "");
+  let dbQuery = supabase.from("whatsapp_contacts").select("id, display_name, phone_number").eq("user_id", userId);
+  dbQuery = digitsOnly.length >= 6 ? dbQuery.ilike("phone_number", `%${digitsOnly}%`) : dbQuery.ilike("display_name", `%${query}%`);
+
+  const { data, error } = await dbQuery.limit(5);
+  if (error) return { error: `Could not look up contact: ${error.message}` };
+  if (!data || data.length === 0) return { error: `No contact found matching "${query}"` };
+  if (data.length > 1) {
+    const names = data.map((c) => c.display_name || c.phone_number).join(", ");
+    return { error: `Multiple contacts match "${query}": ${names} — ask the user which one they mean` };
+  }
+  return { contact: data[0] };
+}
+
+const whatsappTools = [
+  {
+    name: "whatsapp_pending_messages",
+    description:
+      "List the user's WhatsApp contacts whose most recent message is an unanswered incoming one, most recent first. Use this when the user asks what they need to reply to — present them one at a time in your judgment of importance, each with a suggested reply, and move to the next once the current one is handled.",
+    input_schema: { type: "object", properties: {} },
+  },
+  {
+    name: "whatsapp_contact_history",
+    description:
+      "Get recent WhatsApp message history with a specific contact (by name or phone number), plus any active conversation objective for them. Use this to confirm who a name refers to and to get context before drafting a reply or a new message.",
+    input_schema: {
+      type: "object",
+      properties: {
+        contact: { type: "string", description: "Contact name or phone number" },
+        limit: { type: "number", description: "Default 20" },
+      },
+      required: ["contact"],
+    },
+  },
+  {
+    name: "whatsapp_send_message",
+    description:
+      "Send a WhatsApp message to a contact. CRITICAL: only call this after the user has explicitly approved this exact text in their immediately preceding message — never call it to send your own first draft. This applies even to messages toward an active conversation objective; there are no exceptions, ever.",
+    input_schema: {
+      type: "object",
+      properties: {
+        contact: { type: "string", description: "Contact name or phone number" },
+        text: { type: "string" },
+      },
+      required: ["contact", "text"],
+    },
+  },
+  {
+    name: "whatsapp_start_objective",
+    description:
+      "Start tracking a conversation objective with a contact (e.g. 'work toward setting up a date', 'find out if they want to collaborate on X'). Use when the user gives you a goal for an ongoing conversation rather than one message to send.",
+    input_schema: {
+      type: "object",
+      properties: {
+        contact: { type: "string" },
+        objective: { type: "string" },
+      },
+      required: ["contact", "objective"],
+    },
+  },
+  {
+    name: "whatsapp_list_objectives",
+    description: "List active conversation objectives, with how long it's been since the last outbound message to each contact, so you can judge whether a follow-up is due.",
+    input_schema: { type: "object", properties: {} },
+  },
+  {
+    name: "whatsapp_end_objective",
+    description: "Mark a conversation objective completed (achieved) or abandoned (clearly not going to happen) — always explain why to the user, never do this silently.",
+    input_schema: {
+      type: "object",
+      properties: {
+        objectiveId: { type: "string" },
+        status: { type: "string", enum: ["completed", "abandoned"] },
+        reason: { type: "string" },
+      },
+      required: ["objectiveId", "status", "reason"],
+    },
+  },
+];
+
+async function runWhatsappTool(
+  name: string,
+  input: Record<string, unknown>,
+  supabase: SupabaseClient,
+  userId: string,
+): Promise<unknown> {
+  if (name === "whatsapp_pending_messages") {
+    const { data, error } = await supabase
+      .from("whatsapp_messages")
+      .select("contact_id, direction, text, occurred_at, whatsapp_contacts (display_name, phone_number)")
+      .eq("user_id", userId)
+      .order("occurred_at", { ascending: false })
+      .limit(300);
+    if (error) return { error: `Could not load messages: ${error.message}` };
+
+    const seen = new Set<string>();
+    const pending: Array<{ contactId: string; name: string | null; phoneNumber: string | null; lastMessage: string; lastMessageAt: string }> = [];
+    for (const row of data ?? []) {
+      if (seen.has(row.contact_id)) continue;
+      seen.add(row.contact_id);
+      if (row.direction !== "in") continue;
+      // deno-lint-ignore no-explicit-any
+      const contact = row.whatsapp_contacts as any;
+      pending.push({
+        contactId: row.contact_id,
+        name: contact?.display_name ?? null,
+        phoneNumber: contact?.phone_number ?? null,
+        lastMessage: row.text,
+        lastMessageAt: row.occurred_at,
+      });
+      if (pending.length >= 15) break;
+    }
+    return { pending };
+  }
+
+  if (name === "whatsapp_contact_history") {
+    const resolved = await resolveContact(supabase, userId, String(input.contact));
+    if (resolved.error) return { error: resolved.error };
+    const contact = resolved.contact!;
+
+    const [messages, objective] = await Promise.all([
+      supabase
+        .from("whatsapp_messages")
+        .select("direction, text, occurred_at")
+        .eq("user_id", userId)
+        .eq("contact_id", contact.id)
+        .order("occurred_at", { ascending: false })
+        .limit(Number(input.limit) || 20),
+      supabase
+        .from("conversation_objectives")
+        .select("id, objective, status")
+        .eq("user_id", userId)
+        .eq("contact_id", contact.id)
+        .eq("status", "active")
+        .maybeSingle(),
+    ]);
+
+    return {
+      contact: { id: contact.id, name: contact.display_name, phoneNumber: contact.phone_number },
+      messages: (messages.data ?? []).reverse(),
+      activeObjective: objective.data ?? null,
+    };
+  }
+
+  if (name === "whatsapp_send_message") {
+    const resolved = await resolveContact(supabase, userId, String(input.contact));
+    if (resolved.error) return { error: resolved.error };
+
+    const { error } = await supabase
+      .from("whatsapp_outbox")
+      .insert({ user_id: userId, contact_id: resolved.contact!.id, text: String(input.text) });
+    if (error) return { error: `Could not queue the message: ${error.message}` };
+    return { queued: true };
+  }
+
+  if (name === "whatsapp_start_objective") {
+    const resolved = await resolveContact(supabase, userId, String(input.contact));
+    if (resolved.error) return { error: resolved.error };
+
+    const { data: existing } = await supabase
+      .from("conversation_objectives")
+      .select("id")
+      .eq("user_id", userId)
+      .eq("contact_id", resolved.contact!.id)
+      .eq("status", "active")
+      .maybeSingle();
+
+    if (existing) {
+      const { error } = await supabase
+        .from("conversation_objectives")
+        .update({ objective: String(input.objective), updated_at: new Date().toISOString() })
+        .eq("id", existing.id);
+      if (error) return { error: `Could not update objective: ${error.message}` };
+      return { updated: true, objectiveId: existing.id };
+    }
+
+    const { data, error } = await supabase
+      .from("conversation_objectives")
+      .insert({ user_id: userId, contact_id: resolved.contact!.id, objective: String(input.objective) })
+      .select("id")
+      .single();
+    if (error) return { error: `Could not start objective: ${error.message}` };
+    return { started: true, objectiveId: data.id };
+  }
+
+  if (name === "whatsapp_list_objectives") {
+    const { data, error } = await supabase
+      .from("conversation_objectives")
+      .select("id, objective, contact_id, whatsapp_contacts (display_name, phone_number)")
+      .eq("user_id", userId)
+      .eq("status", "active");
+    if (error) return { error: `Could not list objectives: ${error.message}` };
+
+    const objectives = await Promise.all(
+      (data ?? []).map(async (row) => {
+        const { data: lastOut } = await supabase
+          .from("whatsapp_messages")
+          .select("occurred_at")
+          .eq("contact_id", row.contact_id)
+          .eq("direction", "out")
+          .order("occurred_at", { ascending: false })
+          .limit(1)
+          .maybeSingle();
+        // deno-lint-ignore no-explicit-any
+        const contact = row.whatsapp_contacts as any;
+        return {
+          objectiveId: row.id,
+          contact: contact?.display_name ?? contact?.phone_number ?? "unknown",
+          objective: row.objective,
+          lastOutboundAt: lastOut?.occurred_at ?? null,
+        };
+      }),
+    );
+    return { objectives };
+  }
+
+  if (name === "whatsapp_end_objective") {
+    const { error } = await supabase
+      .from("conversation_objectives")
+      .update({ status: String(input.status), stop_reason: String(input.reason), updated_at: new Date().toISOString() })
+      .eq("id", String(input.objectiveId))
+      .eq("user_id", userId);
+    if (error) return { error: `Could not update objective: ${error.message}` };
+    return { updated: true };
+  }
+
+  return { error: `Unknown tool ${name}` };
+}
+
 // ── Shared core — used by both the web chat function and the WhatsApp webhook ──
 
 export type GadfResult = { reply: string } | { error: string; status: number };
@@ -926,7 +1162,8 @@ export async function handleGadfMessage(
       ? "This message came in over WhatsApp — keep replies concise and readable on a phone screen; avoid long tables or heavy markdown."
       : "",
     "For anything financial, you work with Lydia, the user's financial analyst — call consult_lydia and relay/interpret her report rather than just pasting it. Transactions themselves are captured automatically from mobile money SMS forwarded off the user's phones; you have no way to record a transaction yourself. You can use finance_summary/finance_search_transactions/finance_account_balances/finance_safe_to_spend/finance_category_spending/finance_business_project_summary directly for quick lookups without going through Lydia when that's simpler. You can also finance_add_commitment, finance_add_receivable, finance_create_business, finance_create_project, and finance_correct_transaction when the user tells you about an obligation, money owed to them, a new business/project, or that a transaction was misclassified. Some messages may fail to parse, so a gap in the numbers may mean an unparsed message, not that nothing happened — mention that possibility if a total looks off rather than stating it with full confidence.",
-    "You do not yet have tool access to email, contacts, or maps, and you can't send a WhatsApp message on your own initiative (only reply to one) — that arrives in a later build phase. If asked to perform one of those actions, say so plainly instead of pretending to do it.",
+    "Dero watches the user's WhatsApp conversations with other people (not the self-chat you talk to the user through) and archives them. Use whatsapp_pending_messages when asked what needs a reply, or whatsapp_contact_history for context on a specific person. Draft replies and new messages in your own reply text — never call whatsapp_send_message until the user has clearly approved that exact text in their next message; there are no exceptions, including for a message toward an active conversation objective (whatsapp_start_objective/whatsapp_list_objectives/whatsapp_end_objective) — you may plan strategy and pacing autonomously, but a real person only ever receives a message the user actually approved.",
+    "You do not yet have tool access to email or maps — say so plainly if asked rather than pretending to do it.",
   ]
     .filter(Boolean)
     .join("\n\n");
@@ -948,7 +1185,7 @@ export async function handleGadfMessage(
         max_tokens: 1024,
         system: systemPrompt,
         messages,
-        tools: [...googleTools, ...codingTools, ...financeTools],
+        tools: [...googleTools, ...codingTools, ...financeTools, ...whatsappTools],
       }),
     });
 
@@ -973,10 +1210,13 @@ export async function handleGadfMessage(
     for (const toolUse of toolUseBlocks) {
       const isCodingTool = toolUse.name === "queue_coding_task";
       const isFinanceTool = toolUse.name.startsWith("finance_") || toolUse.name === "consult_lydia";
+      const isWhatsappTool = toolUse.name.startsWith("whatsapp_");
       const result = isCodingTool
         ? await runCodingTool(toolUse.name, toolUse.input, supabase, userId)
         : isFinanceTool
         ? await runFinanceTool(toolUse.name, toolUse.input, supabase, userId)
+        : isWhatsappTool
+        ? await runWhatsappTool(toolUse.name, toolUse.input, supabase, userId)
         : await runGoogleTool(toolUse.name, toolUse.input, supabase, userId);
       toolResults.push({
         type: "tool_result",

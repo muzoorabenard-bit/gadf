@@ -11,6 +11,7 @@ import { cn } from "@/lib/utils";
 const GOOGLE_SCOPES = [
   "https://www.googleapis.com/auth/drive",
   "https://www.googleapis.com/auth/calendar",
+  "https://www.googleapis.com/auth/contacts.readonly",
 ].join(" ");
 
 function connectGoogleUrl(userId: string) {
