@@ -7,14 +7,21 @@ import { createClient } from "https://esm.sh/@supabase/supabase-js@2";
 // fully known ahead of time, since forwarder apps vary. So this is
 // deliberately defensive: it accepts GET or POST, reads the body as JSON or
 // form-urlencoded, falls back to query params, and checks several common
-// field names for the sender and message text. It logs whatever it
-// receives either way, so a real payload can be inspected and the parsing
-// tightened later if a message doesn't match any of the guessed fields.
+// field names for the sender and message text.
 //
 // Trust comes from a secret token in the URL path (?token=... would also
 // work, but forwarder apps more reliably support a fixed URL than custom
 // headers) — not a Supabase session, since the forwarder app has no way to
 // hold one.
+//
+// The user's forwarder app can't filter by sender, so it forwards *every*
+// SMS on both phones — personal texts included. isLikelyMobileMoneySms()
+// rejects anything that doesn't look like a transaction before it's logged
+// or sent to Claude, so a personal message's content never gets persisted
+// or leaves this function for an AI call. That filter is a heuristic and
+// may need tightening once we see what real MTN messages look like —
+// message text for anything it accepts is still logged for now, to make
+// that tuning possible; message text for anything it rejects never is.
 const SUPABASE_URL = Deno.env.get("SUPABASE_URL")!;
 const SERVICE_ROLE_KEY = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")!;
 const ANTHROPIC_API_KEY = Deno.env.get("ANTHROPIC_API_KEY")!;
@@ -31,6 +38,25 @@ function firstOf(obj: Record<string, string>, keys: string[]): string {
     if (value) return value;
   }
   return "";
+}
+
+const MTN_SENDER_PATTERNS = ["mtn", "m-money", "mmoney", "mobilemoney"];
+// MTN Mobile Money SMS in Uganda consistently include the currency and one
+// of these transaction-shaped phrases. Requiring both cuts down on a
+// personal message that happens to mention money in passing.
+const TRANSACTION_PHRASES = [
+  "new balance", "your balance", "transaction id", "txn id", "txnid",
+  "you have received", "you have sent", "you have paid", "you have withdrawn",
+  "payment of", "withdrawal of", "deposit of", "mobile money",
+];
+
+function isLikelyMobileMoneySms(sender: string, text: string): boolean {
+  const senderLower = sender.toLowerCase();
+  const textLower = text.toLowerCase();
+  if (MTN_SENDER_PATTERNS.some((p) => senderLower.includes(p))) return true;
+  const hasCurrency = /\bugx\b/i.test(text);
+  const hasTransactionPhrase = TRANSACTION_PHRASES.some((p) => textLower.includes(p));
+  return hasCurrency && hasTransactionPhrase;
 }
 
 async function extractParams(req: Request): Promise<Record<string, string>> {
@@ -129,14 +155,26 @@ serve(async (req) => {
   const text = firstOf(params, TEXT_FIELDS);
   const sourcePhone = firstOf(params, PHONE_FIELDS) || "unknown";
 
-  console.log("gadf-sms-ingest received:", JSON.stringify(params));
-
   if (!text) {
-    return new Response(JSON.stringify({ error: "No message text found in request", received: params }), {
+    // No content was extracted at all — safe to log the field names (not
+    // values weren't found anyway) to help diagnose an unrecognized shape.
+    console.log("gadf-sms-ingest: no message text found among fields", Object.keys(params));
+    return new Response(JSON.stringify({ error: "No message text found in request" }), {
       status: 400,
       headers: { "Content-Type": "application/json" },
     });
   }
+
+  if (!isLikelyMobileMoneySms(sender, text)) {
+    // Deliberately not logging `text` here — this branch is expected to
+    // catch personal messages, since the forwarder app can't filter by
+    // sender before forwarding.
+    return new Response(JSON.stringify({ status: "ignored, not a mobile money message" }), {
+      headers: { "Content-Type": "application/json" },
+    });
+  }
+
+  console.log("gadf-sms-ingest: processing likely mobile money SMS from", sender || "(unknown sender)");
 
   const supabase = createClient(SUPABASE_URL, SERVICE_ROLE_KEY);
   const receivedAt = new Date().toISOString();
