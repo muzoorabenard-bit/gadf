@@ -1,3 +1,6 @@
+// GADF Chat Handler
+// This is the main chat handler shared across the web, watch, and WhatsApp channels.
+
 import { serve } from "https://deno.land/std@0.190.0/http/server.ts";
 import { createClient } from "https://esm.sh/@supabase/supabase-js@2";
 import { corsHeaders } from "../_shared/cors.ts";
