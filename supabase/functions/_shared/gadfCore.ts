@@ -1130,10 +1130,17 @@ export async function handleGadfMessage(
     console.error("Memory retrieval skipped:", embedErr);
   }
 
-  // No recent-message-history replay — each request costs one embedding call
-  // plus a scoped memory search instead of resending a growing transcript on
-  // every turn. Continuity comes from identity_facts + long-term memory
-  // above, not from re-sending prior messages.
+  // Tier 2 — the last 20 messages in this conversation, for short-term
+  // continuity across turns (e.g. approving a draft gadf gave a moment ago).
+  // range(1, 20) skips the newest row, which is the current message inserted
+  // just above, so it isn't duplicated when appended below.
+  const { data: recentMessages } = await supabase
+    .from("messages")
+    .select("role, content")
+    .eq("conversation_id", conversationId)
+    .order("created_at", { ascending: false })
+    .range(1, 20);
+  const history = (recentMessages ?? []).reverse();
 
   const googleConnected = Boolean(GOOGLE_CLIENT_ID) && (await getGoogleAccessToken(supabase, userId)) !== null;
 
@@ -1169,7 +1176,7 @@ export async function handleGadfMessage(
     .join("\n\n");
 
   // deno-lint-ignore no-explicit-any
-  const messages: any[] = [{ role: "user", content: message }];
+  const messages: any[] = [...history, { role: "user", content: message }];
   let reply = "";
 
   for (let round = 0; round < MAX_TOOL_ROUNDS; round++) {
