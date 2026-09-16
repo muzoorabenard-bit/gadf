@@ -120,6 +120,9 @@ async function upsertContactAndLog(
     contactId = created.id;
   }
 
+  // A message can be redelivered on reconnect (see isLive above); the
+  // whatsapp_messages_wa_message_id_idx unique index makes a duplicate a
+  // harmless 23505 rather than a second archived copy.
   const { error: msgError } = await supabase.from("whatsapp_messages").insert({
     user_id: userId,
     contact_id: contactId,
@@ -128,7 +131,7 @@ async function upsertContactAndLog(
     wa_message_id: waMessageId ?? null,
     occurred_at: occurredAt,
   });
-  if (msgError) console.error("Could not log whatsapp message:", msgError);
+  if (msgError && msgError.code !== "23505") console.error("Could not log whatsapp message:", msgError);
 }
 
 // Polls whatsapp_outbox for messages gadf has been explicitly told to send
@@ -205,7 +208,13 @@ async function connect(): Promise<void> {
   });
 
   sock.ev.on("messages.upsert", async ({ messages, type }) => {
-    if (type !== "notify") return;
+    // 'notify' is a live message; anything else (e.g. a reconnect catch-up
+    // batch) is still real and gets archived below, just not treated as a
+    // live self-chat command -- replaying an old command through gadf on
+    // every reconnect would be wrong, but silently losing whatever arrived
+    // while the bot was briefly down is worse. upsertContactAndLog dedupes
+    // on wa_message_id in case the same message is redelivered later.
+    const isLive = type === "notify";
 
     for (const m of messages) {
       if (!m.message || !m.key.id || !m.key.remoteJid) continue;
@@ -222,6 +231,8 @@ async function connect(): Promise<void> {
       const selfJid = `${rawId.split(":")[0]}@s.whatsapp.net`;
       const remoteJidAlt = (m.key as { remoteJidAlt?: string }).remoteJidAlt;
       const isSelfChat = m.key.remoteJid === selfJid || remoteJidAlt === selfJid;
+
+      if (isSelfChat && !isLive) continue;
 
       if (isSelfChat) {
         const text = m.message.conversation ?? m.message.extendedTextMessage?.text ?? "";
