@@ -6,3 +6,6 @@ verify_jwt = false
 
 [functions.gadf-whatsapp-webhook]
 verify_jwt = false
+
+[functions.gadf-sms-ingest]
+verify_jwt = false

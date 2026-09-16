@@ -452,6 +452,92 @@ async function runCodingTool(
   return { error: `Unknown tool ${name}` };
 }
 
+const financeTools = [
+  {
+    name: "finance_summary",
+    description:
+      "Get aggregated totals of the user's mobile money transactions (money in, money out, fees, net) over a date range, optionally broken down by transaction type. Transactions are captured automatically from forwarded MTN Mobile Money SMS — the user never enters these manually.",
+    input_schema: {
+      type: "object",
+      properties: {
+        startDate: { type: "string", description: "ISO date, inclusive. Omit for all-time." },
+        endDate: { type: "string", description: "ISO date, exclusive. Omit for up to now." },
+      },
+    },
+  },
+  {
+    name: "finance_search_transactions",
+    description: "List individual mobile money transactions matching filters, most recent first.",
+    input_schema: {
+      type: "object",
+      properties: {
+        startDate: { type: "string", description: "ISO date, inclusive" },
+        endDate: { type: "string", description: "ISO date, exclusive" },
+        counterparty: { type: "string", description: "Free-text match against the other party's name" },
+        transactionType: { type: "string", enum: ["receive", "send", "payment", "withdraw", "deposit", "airtime", "other"] },
+        limit: { type: "number", description: "Default 20" },
+      },
+    },
+  },
+];
+
+async function runFinanceTool(
+  name: string,
+  input: Record<string, unknown>,
+  supabase: SupabaseClient,
+  userId: string,
+): Promise<unknown> {
+  if (name === "finance_summary") {
+    let query = supabase
+      .from("transactions")
+      .select("transaction_type, amount, fee")
+      .eq("user_id", userId)
+      .eq("parse_status", "parsed");
+    if (input.startDate) query = query.gte("occurred_at", String(input.startDate));
+    if (input.endDate) query = query.lt("occurred_at", String(input.endDate));
+
+    const { data, error } = await query;
+    if (error) return { error: `Could not summarize transactions: ${error.message}` };
+
+    const byType: Record<string, { count: number; total: number }> = {};
+    let moneyIn = 0;
+    let moneyOut = 0;
+    let totalFees = 0;
+    for (const t of data ?? []) {
+      const type = t.transaction_type ?? "other";
+      const amount = Number(t.amount) || 0;
+      byType[type] = byType[type] ?? { count: 0, total: 0 };
+      byType[type].count += 1;
+      byType[type].total += amount;
+      totalFees += Number(t.fee) || 0;
+      if (type === "receive" || type === "deposit") moneyIn += amount;
+      else if (type === "send" || type === "payment" || type === "withdraw" || type === "airtime") moneyOut += amount;
+    }
+
+    return { moneyIn, moneyOut, net: moneyIn - moneyOut, totalFees, byType, transactionCount: data?.length ?? 0 };
+  }
+
+  if (name === "finance_search_transactions") {
+    let query = supabase
+      .from("transactions")
+      .select("transaction_type, amount, currency, counterparty, fee, balance_after, occurred_at, raw_sms")
+      .eq("user_id", userId)
+      .eq("parse_status", "parsed")
+      .order("occurred_at", { ascending: false })
+      .limit(Number(input.limit) || 20);
+    if (input.startDate) query = query.gte("occurred_at", String(input.startDate));
+    if (input.endDate) query = query.lt("occurred_at", String(input.endDate));
+    if (input.transactionType) query = query.eq("transaction_type", String(input.transactionType));
+    if (input.counterparty) query = query.ilike("counterparty", `%${input.counterparty}%`);
+
+    const { data, error } = await query;
+    if (error) return { error: `Could not search transactions: ${error.message}` };
+    return { transactions: data };
+  }
+
+  return { error: `Unknown tool ${name}` };
+}
+
 // ── Shared core — used by both the web chat function and the WhatsApp webhook ──
 
 export type GadfResult = { reply: string } | { error: string; status: number };
@@ -554,7 +640,8 @@ export async function handleGadfMessage(
     channel === "whatsapp"
       ? "This message came in over WhatsApp — keep replies concise and readable on a phone screen; avoid long tables or heavy markdown."
       : "",
-    "You do not yet have tool access to email, contacts, SMS, or maps, and you can't send a WhatsApp message on your own initiative (only reply to one) — that arrives in a later build phase. If asked to perform one of those actions, say so plainly instead of pretending to do it.",
+    "You act as the user's accountant for their MTN Mobile Money activity. Transactions are captured automatically from SMS forwarded off their phones — the user never enters these manually, and you have no way to record a transaction yourself. Use finance_summary for totals/trends over a period and finance_search_transactions to look up specific transactions. Some messages may fail to parse (parse_status 'failed' isn't returned by these tools, so a gap in the numbers may mean an unparsed message, not that nothing happened) — mention that possibility if a total looks off rather than stating it with full confidence.",
+    "You do not yet have tool access to email, contacts, or maps, and you can't send a WhatsApp message on your own initiative (only reply to one) — that arrives in a later build phase. If asked to perform one of those actions, say so plainly instead of pretending to do it.",
   ]
     .filter(Boolean)
     .join("\n\n");
@@ -576,7 +663,7 @@ export async function handleGadfMessage(
         max_tokens: 1024,
         system: systemPrompt,
         messages,
-        tools: [...googleTools, ...codingTools],
+        tools: [...googleTools, ...codingTools, ...financeTools],
       }),
     });
 
@@ -599,8 +686,12 @@ export async function handleGadfMessage(
 
     const toolResults = [];
     for (const toolUse of toolUseBlocks) {
-      const result = toolUse.name === "queue_coding_task"
+      const isCodingTool = toolUse.name === "queue_coding_task";
+      const isFinanceTool = toolUse.name === "finance_summary" || toolUse.name === "finance_search_transactions";
+      const result = isCodingTool
         ? await runCodingTool(toolUse.name, toolUse.input, supabase, userId)
+        : isFinanceTool
+        ? await runFinanceTool(toolUse.name, toolUse.input, supabase, userId)
         : await runGoogleTool(toolUse.name, toolUse.input, supabase, userId);
       toolResults.push({
         type: "tool_result",
