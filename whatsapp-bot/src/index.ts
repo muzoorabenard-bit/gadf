@@ -134,6 +134,41 @@ async function upsertContactAndLog(
   if (msgError && msgError.code !== "23505") console.error("Could not log whatsapp message:", msgError);
 }
 
+// Dero capture path, shared by the live messages.upsert listener and the
+// messaging-history.set listener below (WhatsApp/Baileys can redeliver
+// messages that arrived while this process was briefly disconnected via
+// either event depending on the situation -- listening to only one of them
+// is how a real message went missing with no trace).
+// deno-lint-ignore no-explicit-any
+async function archiveIfEligible(m: any, selfJid: string, source: string): Promise<void> {
+  if (!m.message || !m.key.id || !m.key.remoteJid) return;
+  if (sentByBot.has(m.key.id)) {
+    sentByBot.delete(m.key.id);
+    return;
+  }
+
+  const remoteJidAlt = (m.key as { remoteJidAlt?: string }).remoteJidAlt;
+  const isSelfChat = m.key.remoteJid === selfJid || remoteJidAlt === selfJid;
+  if (isSelfChat) return; // self-chat is only ever handled live, in messages.upsert
+
+  if (
+    m.key.remoteJid.endsWith("@g.us") ||
+    m.key.remoteJid.endsWith("@newsletter") ||
+    m.key.remoteJid.endsWith("@broadcast") ||
+    m.key.participant
+  ) {
+    console.log(`[dero:${source}] skipped non-1:1 — remoteJid=${m.key.remoteJid} participant=${m.key.participant ?? "none"}`);
+    return;
+  }
+
+  const text = extractMessageText(m.message);
+  if (!text) return;
+
+  console.log(`[dero:${source}] capturing — remoteJid=${m.key.remoteJid} remoteJidAlt=${remoteJidAlt ?? "none"} fromMe=${m.key.fromMe}`);
+  const occurredAt = m.messageTimestamp ? new Date(Number(m.messageTimestamp) * 1000).toISOString() : new Date().toISOString();
+  await upsertContactAndLog(m.key.remoteJid, remoteJidAlt, m.pushName ?? undefined, m.key.fromMe ? "out" : "in", text, m.key.id, occurredAt);
+}
+
 // Polls whatsapp_outbox for messages gadf has been explicitly told to send
 // (only ever queued after the user approved the exact text — see
 // gadfCore.ts's whatsapp_send_message tool) and actually sends them.
@@ -207,14 +242,15 @@ async function connect(): Promise<void> {
     }
   });
 
+  const selfJid = (): string => `${(sock.user?.id ?? "").split(":")[0]}@s.whatsapp.net`;
+
   sock.ev.on("messages.upsert", async ({ messages, type }) => {
     // 'notify' is a live message; anything else (e.g. a reconnect catch-up
-    // batch) is still real and gets archived below, just not treated as a
-    // live self-chat command -- replaying an old command through gadf on
-    // every reconnect would be wrong, but silently losing whatever arrived
-    // while the bot was briefly down is worse. upsertContactAndLog dedupes
-    // on wa_message_id in case the same message is redelivered later.
+    // batch delivered through this same event) is still real and gets
+    // archived, just not treated as a live self-chat command -- replaying
+    // an old command through gadf on every reconnect would be wrong.
     const isLive = type === "notify";
+    const self = selfJid();
 
     for (const m of messages) {
       if (!m.message || !m.key.id || !m.key.remoteJid) continue;
@@ -224,17 +260,10 @@ async function connect(): Promise<void> {
         continue;
       }
 
-      // WhatsApp addresses the "Message yourself" chat either as your plain
-      // number JID or, on newer accounts, as an opaque @lid id with the
-      // number given separately in remoteJidAlt -- accept either form.
-      const rawId = sock.user?.id ?? "";
-      const selfJid = `${rawId.split(":")[0]}@s.whatsapp.net`;
       const remoteJidAlt = (m.key as { remoteJidAlt?: string }).remoteJidAlt;
-      const isSelfChat = m.key.remoteJid === selfJid || remoteJidAlt === selfJid;
+      const isSelfChat = m.key.remoteJid === self || remoteJidAlt === self;
 
-      if (isSelfChat && !isLive) continue;
-
-      if (isSelfChat) {
+      if (isSelfChat && isLive) {
         const text = m.message.conversation ?? m.message.extendedTextMessage?.text ?? "";
         if (!text.trim()) continue;
 
@@ -247,37 +276,21 @@ async function connect(): Promise<void> {
         continue;
       }
 
-      // Dero: archive genuine 1:1 chats only. `participant` being set is
-      // the reliable signal for "this isn't really a 1:1 message" (groups,
-      // broadcast lists, status replies) regardless of what remoteJid looks
-      // like -- suffix checks alone let one through once with a fabricated-
-      // looking result, so this is belt-and-suspenders on top of them.
-      if (
-        m.key.remoteJid.endsWith("@g.us") ||
-        m.key.remoteJid.endsWith("@newsletter") ||
-        m.key.remoteJid.endsWith("@broadcast") ||
-        m.key.participant
-      ) {
-        console.log(
-          `[dero] skipped non-1:1 message — remoteJid=${m.key.remoteJid} participant=${m.key.participant ?? "none"} type=${type}`,
-        );
-        continue;
-      }
-      const text = extractMessageText(m.message);
-      if (!text) continue;
-      console.log(`[dero] capturing — remoteJid=${m.key.remoteJid} remoteJidAlt=${remoteJidAlt ?? "none"} fromMe=${m.key.fromMe} type=${type}`);
-      const occurredAt = m.messageTimestamp
-        ? new Date(Number(m.messageTimestamp) * 1000).toISOString()
-        : new Date().toISOString();
-      await upsertContactAndLog(
-        m.key.remoteJid,
-        remoteJidAlt,
-        m.pushName ?? undefined,
-        m.key.fromMe ? "out" : "in",
-        text,
-        m.key.id,
-        occurredAt,
-      );
+      await archiveIfEligible(m, self, "upsert");
+    }
+  });
+
+  // WhatsApp/Baileys can deliver messages that arrived while this process
+  // was briefly disconnected via this separate bulk-sync event instead of
+  // messages.upsert -- missing it is how a real message (confirmed by the
+  // user, never appeared in messages.upsert at all) went uncaptured with no
+  // trace in the logs, even after messages.upsert alone was fixed to accept
+  // non-'notify' events.
+  sock.ev.on("messaging-history.set", async ({ messages }) => {
+    console.log(`[dero:history] messaging-history.set fired with ${messages.length} message(s)`);
+    const self = selfJid();
+    for (const m of messages) {
+      await archiveIfEligible(m, self, "history");
     }
   });
 }
