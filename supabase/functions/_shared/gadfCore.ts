@@ -6,6 +6,10 @@ import {
   getCategorySpending,
   getBusinessFinancials,
   getProjectFinancials,
+  getEmergencyFundProgress,
+  getDebtPayoffPriority,
+  getLifestyleInflationCheck,
+  getBigThreeRatio,
 } from "./financeEngine.ts";
 import { searchContactsByName, lookupContactByPhone } from "./googleContacts.ts";
 
@@ -517,15 +521,42 @@ const financeTools = [
   },
   {
     name: "finance_add_commitment",
-    description: "Record a known upcoming financial obligation (e.g. rent due, a bill) so it's accounted for in safe-to-spend and commitment totals.",
+    description: "Record a known upcoming financial obligation (e.g. rent due, a bill, a debt) so it's accounted for in safe-to-spend, commitment totals, and debt payoff priority.",
     input_schema: {
       type: "object",
       properties: {
         description: { type: "string" },
         amount: { type: "number" },
         dueDate: { type: "string", description: "ISO date, optional" },
+        interestRate: { type: "number", description: "Annual interest rate as a percentage (e.g. 18 for 18%), optional — enables debt avalanche prioritization" },
       },
       required: ["description", "amount"],
+    },
+  },
+  {
+    name: "finance_emergency_fund_progress",
+    description: "Check progress toward the user's configured protected-reserve target (their emergency fund). Returns not-configured explicitly if no target is set — don't guess a target if this happens, ask the user to set one via financial_settings.",
+    input_schema: { type: "object", properties: {} },
+  },
+  {
+    name: "finance_debt_priority",
+    description: "Get pending debts/commitments ordered by debt-avalanche priority (highest interest rate first, since that's what's actually costing the most). Commitments with no interest rate configured are listed last, not assumed to be free.",
+    input_schema: { type: "object", properties: {} },
+  },
+  {
+    name: "finance_lifestyle_check",
+    description: "Compare this month's income/expense growth to last month's, to catch lifestyle inflation (spending growing faster than income) early.",
+    input_schema: { type: "object", properties: {} },
+  },
+  {
+    name: "finance_big_three_ratio",
+    description: "Check what share of income goes to the 'big three' expense categories (housing, transport, food) over a date range — flags when they cross roughly 60% of income, the point where wealth-building gets genuinely hard.",
+    input_schema: {
+      type: "object",
+      properties: {
+        startDate: { type: "string", description: "ISO date, inclusive. Omit for the current month." },
+        endDate: { type: "string", description: "ISO date, exclusive" },
+      },
     },
   },
   {
@@ -675,11 +706,33 @@ async function runFinanceTool(
         description: String(input.description),
         amount: Number(input.amount),
         due_date: input.dueDate ? String(input.dueDate) : null,
+        interest_rate: input.interestRate !== undefined && input.interestRate !== null ? Number(input.interestRate) : null,
       })
       .select("id")
       .single();
     if (error) return { error: `Could not add commitment: ${error.message}` };
     return { added: true, commitmentId: data.id };
+  }
+
+  if (name === "finance_emergency_fund_progress") {
+    return await getEmergencyFundProgress(supabase, userId);
+  }
+
+  if (name === "finance_debt_priority") {
+    return await getDebtPayoffPriority(supabase, userId);
+  }
+
+  if (name === "finance_lifestyle_check") {
+    return await getLifestyleInflationCheck(supabase, userId);
+  }
+
+  if (name === "finance_big_three_ratio") {
+    return await getBigThreeRatio(
+      supabase,
+      userId,
+      input.startDate ? String(input.startDate) : undefined,
+      input.endDate ? String(input.endDate) : undefined,
+    );
   }
 
   if (name === "finance_add_receivable") {
@@ -769,23 +822,39 @@ async function consultLydia(supabase: SupabaseClient, userId: string): Promise<s
   const now = new Date();
   const monthStart = new Date(now.getFullYear(), now.getMonth(), 1).toISOString();
 
-  const [balances, monthActivity, safeToSpend, categorySpending, businessProjects, commitmentsTotal, receivablesTotal, recentTx] =
-    await Promise.all([
-      getAccountBalances(supabase, userId),
-      getIncomeExpense(supabase, userId, monthStart),
-      calculateSafeToSpend(supabase, userId),
-      getCategorySpending(supabase, userId, monthStart),
-      Promise.all([getBusinessFinancials(supabase, userId), getProjectFinancials(supabase, userId)]),
-      supabase.from("commitments").select("description, amount, due_date").eq("user_id", userId).eq("status", "pending"),
-      supabase.from("receivables").select("description, amount, counterparty, expected_date").eq("user_id", userId).eq("status", "pending"),
-      supabase
-        .from("transactions")
-        .select("transaction_type, amount, counterparty, occurred_at")
-        .eq("user_id", userId)
-        .eq("parse_status", "parsed")
-        .order("occurred_at", { ascending: false })
-        .limit(10),
-    ]);
+  const [
+    balances,
+    monthActivity,
+    safeToSpend,
+    categorySpending,
+    businessProjects,
+    commitmentsTotal,
+    receivablesTotal,
+    recentTx,
+    emergencyFund,
+    debtPriority,
+    lifestyleCheck,
+    bigThree,
+  ] = await Promise.all([
+    getAccountBalances(supabase, userId),
+    getIncomeExpense(supabase, userId, monthStart),
+    calculateSafeToSpend(supabase, userId),
+    getCategorySpending(supabase, userId, monthStart),
+    Promise.all([getBusinessFinancials(supabase, userId), getProjectFinancials(supabase, userId)]),
+    supabase.from("commitments").select("description, amount, due_date").eq("user_id", userId).eq("status", "pending"),
+    supabase.from("receivables").select("description, amount, counterparty, expected_date").eq("user_id", userId).eq("status", "pending"),
+    supabase
+      .from("transactions")
+      .select("transaction_type, amount, counterparty, occurred_at")
+      .eq("user_id", userId)
+      .eq("parse_status", "parsed")
+      .order("occurred_at", { ascending: false })
+      .limit(10),
+    getEmergencyFundProgress(supabase, userId),
+    getDebtPayoffPriority(supabase, userId),
+    getLifestyleInflationCheck(supabase, userId),
+    getBigThreeRatio(supabase, userId, monthStart),
+  ]);
 
   const financialState = {
     asOf: now.toISOString(),
@@ -798,6 +867,10 @@ async function consultLydia(supabase: SupabaseClient, userId: string): Promise<s
     pendingCommitments: commitmentsTotal.data ?? [],
     pendingReceivables: receivablesTotal.data ?? [],
     recentTransactions: recentTx.data ?? [],
+    emergencyFundProgress: emergencyFund,
+    debtPayoffPriority: debtPriority,
+    lifestyleInflationCheck: lifestyleCheck,
+    bigThreeExpenseRatioThisMonth: bigThree,
   };
 
   const res = await fetch("https://api.anthropic.com/v1/messages", {
@@ -815,6 +888,7 @@ async function consultLydia(supabase: SupabaseClient, userId: string): Promise<s
         "You are calm, factual, concise, and non-judgmental. State what changed and by how much rather than passing judgment (\"transport spending rose from X to Y\", not \"you were irresponsible\"). No exclamation marks, no emoji, no congratulations.",
         "Every number in the JSON below was already calculated deterministically from real transaction data — you are not doing arithmetic, only explaining it. Never invent a figure, transaction, balance, client, or commitment that isn't in this data. If something needed to answer well isn't present, say so plainly rather than guessing.",
         "Cover, briefly: current cash position, this month's income/expense/net, safe-to-spend (with its components, not just the final number), notable category spending, any business/project activity, pending commitments and receivables, and anything that stands out.",
+        "Also weave in, only when there's something worth saying (skip silently if not configured, unflagged, or unremarkable — don't force a mention): emergency fund progress toward the user's target, which pending debt to prioritize paying off first if more than one has an interest rate set, whether spending is growing faster than income this month (lifestyle inflation), and whether housing+transport+food is eating an unusually large share of income.",
         `Financial state:\n${JSON.stringify(financialState, null, 2)}`,
       ].join("\n\n"),
       messages: [{ role: "user", content: "Give me your current report." }],
@@ -1224,7 +1298,7 @@ export async function handleGadfMessage(
     channel === "whatsapp"
       ? "This message came in over WhatsApp — keep replies concise and readable on a phone screen; avoid long tables or heavy markdown."
       : "",
-    "For anything financial, you work with Lydia, the user's financial analyst — call consult_lydia and relay/interpret her report rather than just pasting it. Transactions themselves are captured automatically from mobile money SMS forwarded off the user's phones; you have no way to record a transaction yourself. You can use finance_summary/finance_search_transactions/finance_account_balances/finance_safe_to_spend/finance_category_spending/finance_business_project_summary directly for quick lookups without going through Lydia when that's simpler. You can also finance_add_commitment, finance_add_receivable, finance_create_business, finance_create_project, and finance_correct_transaction when the user tells you about an obligation, money owed to them, a new business/project, or that a transaction was misclassified. Some messages may fail to parse, so a gap in the numbers may mean an unparsed message, not that nothing happened — mention that possibility if a total looks off rather than stating it with full confidence.",
+    "For anything financial, you work with Lydia, the user's financial analyst — call consult_lydia and relay/interpret her report rather than just pasting it; her regular report already weaves in emergency fund progress, debt payoff priority, lifestyle inflation, and the housing/transport/food ratio when there's something worth saying about them. Transactions themselves are captured automatically from mobile money SMS forwarded off the user's phones; you have no way to record a transaction yourself. You can use finance_summary/finance_search_transactions/finance_account_balances/finance_safe_to_spend/finance_category_spending/finance_business_project_summary/finance_emergency_fund_progress/finance_debt_priority/finance_lifestyle_check/finance_big_three_ratio directly for quick lookups without going through Lydia when that's simpler. You can also finance_add_commitment (optionally with an interest rate, for debt priority), finance_add_receivable, finance_create_business, finance_create_project, and finance_correct_transaction when the user tells you about an obligation, money owed to them, a new business/project, or that a transaction was misclassified. Some messages may fail to parse, so a gap in the numbers may mean an unparsed message, not that nothing happened — mention that possibility if a total looks off rather than stating it with full confidence.",
     "Dero watches the user's WhatsApp conversations with other people (not the self-chat you talk to the user through) and archives them. Use whatsapp_pending_messages when asked what needs a reply, or whatsapp_contact_history for context on a specific person. Draft replies and new messages in your own reply text — never call whatsapp_send_message until the user has clearly approved that exact text in their next message; there are no exceptions, including for a message toward an active conversation objective (whatsapp_start_objective/whatsapp_list_objectives/whatsapp_end_objective) — you may plan strategy and pacing autonomously, but a real person only ever receives a message the user actually approved.",
     "You do not yet have tool access to email or maps — say so plainly if asked rather than pretending to do it.",
   ]

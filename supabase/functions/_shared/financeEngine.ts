@@ -228,6 +228,151 @@ export async function getBusinessFinancials(supabase: SupabaseClient, userId: st
   return results;
 }
 
+interface EmergencyFundProgress {
+  currentCash: number;
+  target: number | null;
+  progressPct: number | null;
+  configured: boolean;
+}
+
+export async function getEmergencyFundProgress(supabase: SupabaseClient, userId: string): Promise<EmergencyFundProgress> {
+  const [balances, { data: settings }] = await Promise.all([
+    getAccountBalances(supabase, userId),
+    supabase.from("financial_settings").select("protected_reserve").eq("user_id", userId).maybeSingle(),
+  ]);
+  const currentCash = balances.reduce((sum, b) => sum + (b.balance ?? 0), 0);
+  const target = settings?.protected_reserve ?? null;
+  if (target === null || target <= 0) return { currentCash, target: null, progressPct: null, configured: false };
+  return { currentCash, target, progressPct: Math.min(100, (currentCash / target) * 100), configured: true };
+}
+
+interface DebtPriorityItem {
+  id: string;
+  description: string;
+  amount: number;
+  interestRate: number | null;
+  dueDate: string | null;
+}
+
+// Debt avalanche: highest interest rate first, since that's what's actually
+// costing the most regardless of balance size. A commitment with no rate
+// configured sorts last rather than being assumed to cost 0%.
+export async function getDebtPayoffPriority(
+  supabase: SupabaseClient,
+  userId: string,
+): Promise<{ prioritized: DebtPriorityItem[]; anyRatesConfigured: boolean }> {
+  const { data } = await supabase
+    .from("commitments")
+    .select("id, description, amount, interest_rate, due_date")
+    .eq("user_id", userId)
+    .eq("status", "pending");
+
+  const items: DebtPriorityItem[] = (data ?? []).map((c) => ({
+    id: c.id,
+    description: c.description,
+    amount: Number(c.amount) || 0,
+    interestRate: c.interest_rate === null || c.interest_rate === undefined ? null : Number(c.interest_rate),
+    dueDate: c.due_date,
+  }));
+
+  const prioritized = [...items].sort((a, b) => {
+    if (a.interestRate === null && b.interestRate === null) return 0;
+    if (a.interestRate === null) return 1;
+    if (b.interestRate === null) return -1;
+    return b.interestRate - a.interestRate;
+  });
+
+  return { prioritized, anyRatesConfigured: items.some((i) => i.interestRate !== null) };
+}
+
+interface LifestyleInflationCheck {
+  currentMonth: IncomeExpense;
+  previousMonth: IncomeExpense;
+  incomeGrowthPct: number | null;
+  expenseGrowthPct: number | null;
+  flagged: boolean;
+}
+
+// Flags when spending is growing faster than income month over month --
+// the classic lifestyle-inflation pattern where a raise quietly gets
+// absorbed by higher spending instead of building wealth.
+export async function getLifestyleInflationCheck(supabase: SupabaseClient, userId: string): Promise<LifestyleInflationCheck> {
+  const now = new Date();
+  const currentStart = new Date(now.getFullYear(), now.getMonth(), 1).toISOString();
+  const previousStart = new Date(now.getFullYear(), now.getMonth() - 1, 1).toISOString();
+
+  const [currentMonth, previousMonth] = await Promise.all([
+    getIncomeExpense(supabase, userId, currentStart),
+    getIncomeExpense(supabase, userId, previousStart, currentStart),
+  ]);
+
+  const incomeGrowthPct = previousMonth.income > 0 ? ((currentMonth.income - previousMonth.income) / previousMonth.income) * 100 : null;
+  const expenseGrowthPct = previousMonth.expense > 0 ? ((currentMonth.expense - previousMonth.expense) / previousMonth.expense) * 100 : null;
+  const flagged = incomeGrowthPct !== null && expenseGrowthPct !== null && incomeGrowthPct > 0 && expenseGrowthPct > incomeGrowthPct;
+
+  return { currentMonth, previousMonth, incomeGrowthPct, expenseGrowthPct, flagged };
+}
+
+interface BigThreeCheck {
+  housingSpend: number;
+  transportSpend: number;
+  foodSpend: number;
+  totalBigThree: number;
+  income: number;
+  bigThreePct: number | null;
+  flagged: boolean;
+}
+
+// The "big three" (housing/transport/food) benchmark: flags when they
+// together cross ~60% of income, the point where wealth-building becomes
+// genuinely hard regardless of budgeting discipline elsewhere.
+export async function getBigThreeRatio(
+  supabase: SupabaseClient,
+  userId: string,
+  startDate?: string,
+  endDate?: string,
+): Promise<BigThreeCheck> {
+  const { data: categories } = await supabase.from("categories").select("id, name, parent_id").eq("user_id", userId);
+  const categoryById = new Map((categories ?? []).map((c) => [c.id, c]));
+
+  function rootName(categoryId: string | null): string | null {
+    let current = categoryId ? categoryById.get(categoryId) : undefined;
+    let guard = 0;
+    while (current?.parent_id && guard < 10) {
+      current = categoryById.get(current.parent_id);
+      guard += 1;
+    }
+    return current?.name ?? null;
+  }
+
+  let txQuery = supabase
+    .from("transactions")
+    .select("amount, category_id")
+    .eq("user_id", userId)
+    .eq("parse_status", "parsed")
+    .eq("is_transfer", false)
+    .in("transaction_type", ["send", "payment", "withdraw", "airtime"]);
+  if (startDate) txQuery = txQuery.gte("occurred_at", startDate);
+  if (endDate) txQuery = txQuery.lt("occurred_at", endDate);
+
+  const [{ data: transactions }, income] = await Promise.all([txQuery, getIncomeExpense(supabase, userId, startDate, endDate)]);
+
+  let housingSpend = 0;
+  let transportSpend = 0;
+  let foodSpend = 0;
+  for (const t of transactions ?? []) {
+    const root = rootName(t.category_id);
+    const amount = Number(t.amount) || 0;
+    if (root === "Housing") housingSpend += amount;
+    else if (root === "Transport") transportSpend += amount;
+    else if (root === "Food") foodSpend += amount;
+  }
+
+  const totalBigThree = housingSpend + transportSpend + foodSpend;
+  const bigThreePct = income.income > 0 ? (totalBigThree / income.income) * 100 : null;
+  return { housingSpend, transportSpend, foodSpend, totalBigThree, income: income.income, bigThreePct, flagged: (bigThreePct ?? 0) >= 60 };
+}
+
 export async function getProjectFinancials(supabase: SupabaseClient, userId: string): Promise<EntityFinancials[]> {
   const { data: projects } = await supabase.from("projects").select("id, name").eq("user_id", userId);
   const results: EntityFinancials[] = [];
