@@ -534,8 +534,19 @@ const financeTools = [
     },
   },
   {
+    name: "finance_update_settings",
+    description: "Set the user's protected reserve (emergency fund target) and/or essential monthly expenses — these power finance_safe_to_spend and finance_emergency_fund_progress. Call this whenever the user tells you either number; omit a field to leave it unchanged.",
+    input_schema: {
+      type: "object",
+      properties: {
+        protectedReserve: { type: "number", description: "Emergency fund target, in the user's currency" },
+        essentialMonthlyExpenses: { type: "number", description: "Essential monthly expenses, in the user's currency" },
+      },
+    },
+  },
+  {
     name: "finance_emergency_fund_progress",
-    description: "Check progress toward the user's configured protected-reserve target (their emergency fund). Returns not-configured explicitly if no target is set — don't guess a target if this happens, ask the user to set one via financial_settings.",
+    description: "Check progress toward the user's configured protected-reserve target (their emergency fund). Returns not-configured explicitly if no target is set — don't guess a target if this happens, ask the user for one and call finance_update_settings.",
     input_schema: { type: "object", properties: {} },
   },
   {
@@ -712,6 +723,20 @@ async function runFinanceTool(
       .single();
     if (error) return { error: `Could not add commitment: ${error.message}` };
     return { added: true, commitmentId: data.id };
+  }
+
+  if (name === "finance_update_settings") {
+    // deno-lint-ignore no-explicit-any
+    const update: Record<string, any> = { user_id: userId, updated_at: new Date().toISOString() };
+    if (input.protectedReserve !== undefined && input.protectedReserve !== null) update.protected_reserve = Number(input.protectedReserve);
+    if (input.essentialMonthlyExpenses !== undefined && input.essentialMonthlyExpenses !== null) {
+      update.essential_monthly_expenses = Number(input.essentialMonthlyExpenses);
+    }
+    if (Object.keys(update).length <= 2) return { error: "Nothing to update — provide protectedReserve and/or essentialMonthlyExpenses" };
+
+    const { error } = await supabase.from("financial_settings").upsert(update, { onConflict: "user_id" });
+    if (error) return { error: `Could not update settings: ${error.message}` };
+    return { updated: true };
   }
 
   if (name === "finance_emergency_fund_progress") {
@@ -1298,7 +1323,7 @@ export async function handleGadfMessage(
     channel === "whatsapp"
       ? "This message came in over WhatsApp — keep replies concise and readable on a phone screen; avoid long tables or heavy markdown."
       : "",
-    "For anything financial, you work with Lydia, the user's financial analyst — call consult_lydia and relay/interpret her report rather than just pasting it; her regular report already weaves in emergency fund progress, debt payoff priority, lifestyle inflation, and the housing/transport/food ratio when there's something worth saying about them. Transactions themselves are captured automatically from mobile money SMS forwarded off the user's phones; you have no way to record a transaction yourself. You can use finance_summary/finance_search_transactions/finance_account_balances/finance_safe_to_spend/finance_category_spending/finance_business_project_summary/finance_emergency_fund_progress/finance_debt_priority/finance_lifestyle_check/finance_big_three_ratio directly for quick lookups without going through Lydia when that's simpler. You can also finance_add_commitment (optionally with an interest rate, for debt priority), finance_add_receivable, finance_create_business, finance_create_project, and finance_correct_transaction when the user tells you about an obligation, money owed to them, a new business/project, or that a transaction was misclassified. Some messages may fail to parse, so a gap in the numbers may mean an unparsed message, not that nothing happened — mention that possibility if a total looks off rather than stating it with full confidence.",
+    "For anything financial, you work with Lydia, the user's financial analyst — call consult_lydia and relay/interpret her report rather than just pasting it; her regular report already weaves in emergency fund progress, debt payoff priority, lifestyle inflation, and the housing/transport/food ratio when there's something worth saying about them. Transactions themselves are captured automatically from mobile money SMS forwarded off the user's phones; you have no way to record a transaction yourself. You can use finance_summary/finance_search_transactions/finance_account_balances/finance_safe_to_spend/finance_category_spending/finance_business_project_summary/finance_emergency_fund_progress/finance_debt_priority/finance_lifestyle_check/finance_big_three_ratio directly for quick lookups without going through Lydia when that's simpler. You can also finance_add_commitment (optionally with an interest rate, for debt priority), finance_add_receivable, finance_create_business, finance_create_project, finance_correct_transaction, and finance_update_settings (protected reserve / essential monthly expenses — call this whenever the user tells you either number, don't just note it in Drive) when the user tells you about an obligation, money owed to them, a new business/project, a transaction that was misclassified, or their reserve/expense targets. Some messages may fail to parse, so a gap in the numbers may mean an unparsed message, not that nothing happened — mention that possibility if a total looks off rather than stating it with full confidence.",
     "Dero watches the user's WhatsApp conversations with other people (not the self-chat you talk to the user through) and archives them. Use whatsapp_pending_messages when asked what needs a reply, or whatsapp_contact_history for context on a specific person. Draft replies and new messages in your own reply text — never call whatsapp_send_message until the user has clearly approved that exact text in their next message; there are no exceptions, including for a message toward an active conversation objective (whatsapp_start_objective/whatsapp_list_objectives/whatsapp_end_objective) — you may plan strategy and pacing autonomously, but a real person only ever receives a message the user actually approved.",
     "You do not yet have tool access to email or maps — say so plainly if asked rather than pretending to do it.",
   ]
