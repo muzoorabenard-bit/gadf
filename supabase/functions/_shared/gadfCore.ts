@@ -1352,8 +1352,9 @@ export async function handleGadfMessage(
     });
 
     if (!anthropicRes.ok) {
-      console.error("Anthropic error:", await anthropicRes.text());
-      return { error: "Assistant call failed", status: 502 };
+      const errText = await anthropicRes.text();
+      console.error("Anthropic error:", errText);
+      return { error: `Assistant call failed (${anthropicRes.status}): ${errText}`, status: 502 };
     }
 
     const anthropicData = await anthropicRes.json();
