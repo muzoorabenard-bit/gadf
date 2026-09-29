@@ -79,6 +79,19 @@ export async function getGoogleAccessToken(supabase: SupabaseClient, userId: str
   return data.access_token as string;
 }
 
+// Anthropic-hosted server tool — the search itself runs on Anthropic's
+// infrastructure, not in this function. No client-side dispatch needed:
+// Claude issues a `server_tool_use` block (not `tool_use`, so the dispatch
+// loop below never sees it) and the search result comes back as part of the
+// same turn, already resolved. max_uses caps searches per message for cost.
+const webSearchTools = [
+  {
+    type: "web_search_20260209",
+    name: "web_search",
+    max_uses: 5,
+  },
+];
+
 const googleTools = [
   {
     name: "drive_search",
@@ -1325,6 +1338,7 @@ export async function handleGadfMessage(
       : "",
     "For anything financial, you work with Lydia, the user's financial analyst — call consult_lydia and relay/interpret her report rather than just pasting it; her regular report already weaves in emergency fund progress, debt payoff priority, lifestyle inflation, and the housing/transport/food ratio when there's something worth saying about them. Transactions themselves are captured automatically from mobile money SMS forwarded off the user's phones; you have no way to record a transaction yourself. You can use finance_summary/finance_search_transactions/finance_account_balances/finance_safe_to_spend/finance_category_spending/finance_business_project_summary/finance_emergency_fund_progress/finance_debt_priority/finance_lifestyle_check/finance_big_three_ratio directly for quick lookups without going through Lydia when that's simpler. You can also finance_add_commitment (optionally with an interest rate, for debt priority), finance_add_receivable, finance_create_business, finance_create_project, finance_correct_transaction, and finance_update_settings (protected reserve / essential monthly expenses — call this whenever the user tells you either number, don't just note it in Drive) when the user tells you about an obligation, money owed to them, a new business/project, a transaction that was misclassified, or their reserve/expense targets. Some messages may fail to parse, so a gap in the numbers may mean an unparsed message, not that nothing happened — mention that possibility if a total looks off rather than stating it with full confidence.",
     "Dero watches the user's WhatsApp conversations with other people (not the self-chat you talk to the user through) and archives them. Use whatsapp_pending_messages when asked what needs a reply, or whatsapp_contact_history for context on a specific person. Draft replies and new messages in your own reply text — never call whatsapp_send_message until the user has clearly approved that exact text in their next message; there are no exceptions, including for a message toward an active conversation objective (whatsapp_start_objective/whatsapp_list_objectives/whatsapp_end_objective) — you may plan strategy and pacing autonomously, but a real person only ever receives a message the user actually approved.",
+    "You have a web_search tool for looking up current information, facts, or anything you're not confident about — use it rather than guessing, and keep the answer itself brief per the brevity rule above even though the search results are longer.",
     "You do not yet have tool access to email or maps — say so plainly if asked rather than pretending to do it.",
   ]
     .filter(Boolean)
@@ -1347,7 +1361,7 @@ export async function handleGadfMessage(
         max_tokens: 1024,
         system: systemPrompt,
         messages,
-        tools: [...googleTools, ...codingTools, ...financeTools, ...whatsappTools],
+        tools: [...googleTools, ...codingTools, ...financeTools, ...whatsappTools, ...webSearchTools],
       }),
     });
 
