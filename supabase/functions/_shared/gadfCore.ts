@@ -1323,12 +1323,16 @@ export async function handleGadfMessage(
     minute: "2-digit",
   });
 
-  const systemPrompt = [
+  // Stable block: identical on every call for this user (aside from the
+  // Google-connected/channel flags, which change rarely, not per-message —
+  // a cache_control breakpoint goes at the end of this block. Measured via
+  // count_tokens before caching: 34 tools + this text = ~12,800 of a
+  // ~13,300-token request, resent uncached on every single turn. Volatile
+  // per-request content (timestamp, identity facts, memory search results)
+  // must stay OUT of this block, or the cache would invalidate every call.
+  const stableSystemText = [
     "You are G.A.D.F (Grace and Daddy Forever), a personal assistant with a warm, direct, loyal personality.",
     "Default to brief replies — under 20 words unless the user asks for detail, more context, or a report/analysis (e.g. a Lydia consult). No padding, no restating the question, no unnecessary caveats. Give full detail only when actually asked for it.",
-    `Current date/time: ${nowReadable} (${CALENDAR_TIMEZONE}). ISO: ${now.toISOString()}. Use this as "now" for anything relative — today, tomorrow, next week, in an hour, etc. — including when calling calendar tools.`,
-    identityBlock ? `Known facts about the user:\n${identityBlock}` : "",
-    memoryBlock ? `Relevant memories:\n${memoryBlock}` : "",
     googleConnected
       ? "You have full read/write access to the user's Google Drive and Google Calendar via the drive_* and calendar_* tools. Drive deletes move files to Trash (recoverable); calendar_delete_event is permanent with no undo — be reasonably sure before calling it, but you do not need to ask the user for confirmation first for either."
       : "Google Drive and Calendar aren't connected yet. If asked to do something with either, tell the user to connect Google from the website.",
@@ -1344,43 +1348,28 @@ export async function handleGadfMessage(
     .filter(Boolean)
     .join("\n\n");
 
+  const volatileSystemText = [
+    `Current date/time: ${nowReadable} (${CALENDAR_TIMEZONE}). ISO: ${now.toISOString()}. Use this as "now" for anything relative — today, tomorrow, next week, in an hour, etc. — including when calling calendar tools.`,
+    identityBlock ? `Known facts about the user:\n${identityBlock}` : "",
+    memoryBlock ? `Relevant memories:\n${memoryBlock}` : "",
+  ]
+    .filter(Boolean)
+    .join("\n\n");
+
+  // deno-lint-ignore no-explicit-any
+  const systemPrompt: any[] = [{ type: "text", text: stableSystemText, cache_control: { type: "ephemeral", ttl: "1h" } }];
+  if (volatileSystemText) systemPrompt.push({ type: "text", text: volatileSystemText });
+
+  // Tools never vary call-to-call, so the whole array is cacheable —
+  // cache_control on the last entry caches everything up to and including
+  // it (tools render before system in the prefix, so this covers all 34).
+  // deno-lint-ignore no-explicit-any
+  const allTools: any[] = [...googleTools, ...codingTools, ...financeTools, ...whatsappTools, ...webSearchTools];
+  allTools[allTools.length - 1] = { ...allTools[allTools.length - 1], cache_control: { type: "ephemeral", ttl: "1h" } };
+
   // deno-lint-ignore no-explicit-any
   const messages: any[] = [...history, { role: "user", content: message }];
   let reply = "";
-
-  // TEMPORARY cost-profiling probe — measures the real token cost of this
-  // exact system prompt + tool set via the free count_tokens endpoint,
-  // instead of guessing. Removed once the profile is captured.
-  if (message === "__COST_PROBE__") {
-    const allTools = [...googleTools, ...codingTools, ...financeTools, ...whatsappTools, ...webSearchTools];
-    const [toolsOnly, toolsAndSystem, full] = await Promise.all([
-      fetch("https://api.anthropic.com/v1/messages/count_tokens", {
-        method: "POST",
-        headers: { "Content-Type": "application/json", "x-api-key": ANTHROPIC_API_KEY, "anthropic-version": "2023-06-01" },
-        body: JSON.stringify({ model: "claude-sonnet-5", tools: allTools, messages: [{ role: "user", content: "x" }] }),
-      }).then((r) => r.json()),
-      fetch("https://api.anthropic.com/v1/messages/count_tokens", {
-        method: "POST",
-        headers: { "Content-Type": "application/json", "x-api-key": ANTHROPIC_API_KEY, "anthropic-version": "2023-06-01" },
-        body: JSON.stringify({ model: "claude-sonnet-5", system: systemPrompt, tools: allTools, messages: [{ role: "user", content: "x" }] }),
-      }).then((r) => r.json()),
-      fetch("https://api.anthropic.com/v1/messages/count_tokens", {
-        method: "POST",
-        headers: { "Content-Type": "application/json", "x-api-key": ANTHROPIC_API_KEY, "anthropic-version": "2023-06-01" },
-        body: JSON.stringify({ model: "claude-sonnet-5", system: systemPrompt, tools: allTools, messages }),
-      }).then((r) => r.json()),
-    ]);
-    return {
-      reply: JSON.stringify({
-        toolCount: allTools.length,
-        toolsOnlyTokens: toolsOnly.input_tokens,
-        toolsAndSystemTokens: toolsAndSystem.input_tokens,
-        fullRequestTokens: full.input_tokens,
-        historyMessageCount: history.length,
-        systemPromptChars: systemPrompt.length,
-      }),
-    };
-  }
 
   for (let round = 0; round < MAX_TOOL_ROUNDS; round++) {
     const anthropicRes = await fetch("https://api.anthropic.com/v1/messages", {
@@ -1395,7 +1384,7 @@ export async function handleGadfMessage(
         max_tokens: 1024,
         system: systemPrompt,
         messages,
-        tools: [...googleTools, ...codingTools, ...financeTools, ...whatsappTools, ...webSearchTools],
+        tools: allTools,
       }),
     });
 
@@ -1405,6 +1394,10 @@ export async function handleGadfMessage(
     }
 
     const anthropicData = await anthropicRes.json();
+    const u = anthropicData.usage ?? {};
+    console.log(
+      `usage: input=${u.input_tokens} cache_write=${u.cache_creation_input_tokens ?? 0} cache_read=${u.cache_read_input_tokens ?? 0} output=${u.output_tokens}`,
+    );
     const content = anthropicData.content ?? [];
     const toolUseBlocks = content.filter((b: { type: string }) => b.type === "tool_use");
 
