@@ -1367,44 +1367,6 @@ export async function handleGadfMessage(
   const allTools: any[] = [...googleTools, ...codingTools, ...financeTools, ...whatsappTools, ...webSearchTools];
   allTools[allTools.length - 1] = { ...allTools[allTools.length - 1], cache_control: { type: "ephemeral", ttl: "1h" } };
 
-  // TEMPORARY effort-sweep probe — runs one real-shaped prompt at a given
-  // output_config.effort against the same cached tools/system, for a manual
-  // side-by-side (no eval exists, so this is a spot-check, not a pass/fail).
-  // No history, no DB write — isolated from the real conversation.
-  if (message.startsWith("__EFFORT_SWEEP__:")) {
-    const [, rest] = message.split("__EFFORT_SWEEP__:");
-    const sep = rest.indexOf("|");
-    const effort = rest.slice(0, sep);
-    const probeMessage = rest.slice(sep + 1);
-    const res = await fetch("https://api.anthropic.com/v1/messages", {
-      method: "POST",
-      headers: { "Content-Type": "application/json", "x-api-key": ANTHROPIC_API_KEY, "anthropic-version": "2023-06-01" },
-      body: JSON.stringify({
-        model: "claude-sonnet-5",
-        max_tokens: 1024,
-        system: systemPrompt,
-        messages: [{ role: "user", content: probeMessage }],
-        tools: allTools,
-        output_config: { effort },
-      }),
-    });
-    const data = await res.json();
-    if (!res.ok) return { reply: `ERROR: ${JSON.stringify(data)}` };
-    const u = data.usage ?? {};
-    const textBlock = (data.content ?? []).find((b: { type: string }) => b.type === "text");
-    const toolCalls = (data.content ?? []).filter((b: { type: string }) => b.type === "tool_use").map((b: { name: string }) => b.name);
-    return {
-      reply: JSON.stringify({
-        effort,
-        text: textBlock?.text ?? "(no text — stop_reason: " + data.stop_reason + ")",
-        toolCalls,
-        input: u.input_tokens,
-        output: u.output_tokens,
-        cacheRead: u.cache_read_input_tokens ?? 0,
-      }),
-    };
-  }
-
   // deno-lint-ignore no-explicit-any
   const messages: any[] = [...history, { role: "user", content: message }];
   let reply = "";
@@ -1423,6 +1385,14 @@ export async function handleGadfMessage(
         system: systemPrompt,
         messages,
         tools: allTools,
+        // Cost spot-check (4 representative prompts x low/medium/high) showed
+        // identical tool selection and equivalent answer quality across every
+        // effort level on this chat/tool-routing workload -- low was often
+        // *terser*, which fits gadf's own brevity rule better than high's
+        // extra hedging. No eval exists for gadf, so this was the user's own
+        // judgment call on a manual side-by-side, not an automated pass/fail
+        // -- re-sweep if a harder task category shows it needs more.
+        output_config: { effort: "low" },
       }),
     });
 
