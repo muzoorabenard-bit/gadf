@@ -1348,6 +1348,40 @@ export async function handleGadfMessage(
   const messages: any[] = [...history, { role: "user", content: message }];
   let reply = "";
 
+  // TEMPORARY cost-profiling probe — measures the real token cost of this
+  // exact system prompt + tool set via the free count_tokens endpoint,
+  // instead of guessing. Removed once the profile is captured.
+  if (message === "__COST_PROBE__") {
+    const allTools = [...googleTools, ...codingTools, ...financeTools, ...whatsappTools, ...webSearchTools];
+    const [toolsOnly, toolsAndSystem, full] = await Promise.all([
+      fetch("https://api.anthropic.com/v1/messages/count_tokens", {
+        method: "POST",
+        headers: { "Content-Type": "application/json", "x-api-key": ANTHROPIC_API_KEY, "anthropic-version": "2023-06-01" },
+        body: JSON.stringify({ model: "claude-sonnet-5", tools: allTools, messages: [{ role: "user", content: "x" }] }),
+      }).then((r) => r.json()),
+      fetch("https://api.anthropic.com/v1/messages/count_tokens", {
+        method: "POST",
+        headers: { "Content-Type": "application/json", "x-api-key": ANTHROPIC_API_KEY, "anthropic-version": "2023-06-01" },
+        body: JSON.stringify({ model: "claude-sonnet-5", system: systemPrompt, tools: allTools, messages: [{ role: "user", content: "x" }] }),
+      }).then((r) => r.json()),
+      fetch("https://api.anthropic.com/v1/messages/count_tokens", {
+        method: "POST",
+        headers: { "Content-Type": "application/json", "x-api-key": ANTHROPIC_API_KEY, "anthropic-version": "2023-06-01" },
+        body: JSON.stringify({ model: "claude-sonnet-5", system: systemPrompt, tools: allTools, messages }),
+      }).then((r) => r.json()),
+    ]);
+    return {
+      reply: JSON.stringify({
+        toolCount: allTools.length,
+        toolsOnlyTokens: toolsOnly.input_tokens,
+        toolsAndSystemTokens: toolsAndSystem.input_tokens,
+        fullRequestTokens: full.input_tokens,
+        historyMessageCount: history.length,
+        systemPromptChars: systemPrompt.length,
+      }),
+    };
+  }
+
   for (let round = 0; round < MAX_TOOL_ROUNDS; round++) {
     const anthropicRes = await fetch("https://api.anthropic.com/v1/messages", {
       method: "POST",
