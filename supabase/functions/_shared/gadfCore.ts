@@ -1404,6 +1404,9 @@ export async function handleGadfMessage(
     if (anthropicData.stop_reason !== "tool_use" || toolUseBlocks.length === 0) {
       const textBlock = content.find((b: { type: string; text?: string }) => b.type === "text");
       reply = textBlock?.text ?? "";
+      if (message.includes("__SHOW_USAGE__")) {
+        reply += ` [usage: input=${u.input_tokens} cache_write=${u.cache_creation_input_tokens ?? 0} cache_read=${u.cache_read_input_tokens ?? 0}]`;
+      }
       break;
     }
 
