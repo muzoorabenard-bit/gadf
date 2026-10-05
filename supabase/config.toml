@@ -15,3 +15,6 @@ verify_jwt = false
 
 [functions.gadf-whatsapp-drive-sync]
 verify_jwt = false
+
+[functions.gadf-proactive-check]
+verify_jwt = false
